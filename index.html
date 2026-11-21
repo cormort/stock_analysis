@@ -560,7 +560,8 @@ async function showQuote() {
       q = quoteCache[code] = { at: Date.now(), data: (await r.json())[code] };
     }
     const d = q.data;
-    if (!d || d.price === null) { box.textContent = '📡 查無即時報價（僅支援上市股票）'; return; }
+    if (!d) { box.textContent = '📡 查無即時報價（僅支援上市股票）'; return; }
+    if (d.price === null) { box.textContent = `📡 今日尚無成交　昨收 ${d.prev_close ?? '—'}`; return; }
     const cls = d.change_pct > 0 ? 'pos' : (d.change_pct < 0 ? 'neg' : '');
     box.innerHTML = `📡 <b>即時報價</b>　成交價 <b>${d.price}</b>　` +
       `<span class="${cls}">${d.change_pct > 0 ? '+' : ''}${d.change_pct ?? '—'}%</span>　` +
