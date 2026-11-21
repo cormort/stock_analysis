@@ -1,12 +1,12 @@
 {
   "snapshots": [
     {
-      "file": "snapshot_20261121_113514.json",
-      "generated_at": "2026-11-21T11:35:14",
-      "generated_at_display": "2026-11-21 11:35:14",
+      "file": "snapshot_20261121_125136.json",
+      "generated_at": "2026-11-21T12:51:36",
+      "generated_at_display": "2026-11-21 12:51:36",
       "counts": {
         "value": 6,
-        "sheet1": 162,
+        "sheet1": 159,
         "sheet2": 47,
         "all": 1086
       },

@@ -67,11 +67,19 @@ def twse_dividend_events(div_df: pd.DataFrame) -> dict[str, list[dict]]:
         return {}
     d = div_df.copy()
     d["_year"] = pd.to_numeric(d[ycol], errors="coerce")
+    # 只接受「完整年度」的股利列；季配/半年配在 TWSE 只有最近幾季，
+    # 直接加總會把 2330 的 3 季（23 元）或單季（6 元）當成年股利 → 寧可留 null。
+    pcol = next((c for c in d.columns if "股利所屬期間" in c), None)
+    if pcol:
+        period = d[pcol].astype(str)
+        annual = period.str.contains("0101~", na=False) & period.str.contains("1231", na=False)
+        d = d[annual]
     for c in cols:
         d[c] = pd.to_numeric(d[c].replace("", np.nan), errors="coerce").fillna(0)
     d["_cash"] = d[cols].sum(axis=1)
     d = d.dropna(subset=["_year"])
-    d = d[d["_year"] <= date.today().year - 1911]
+    # 排除尚未完成的年度（今年）
+    d = d[d["_year"] < date.today().year - 1911]
     out = {}
     for (code, roc_year), g in d.groupby(["代號", "_year"]):
         amount = round(float(g["_cash"].sum()), 4)
@@ -228,6 +236,7 @@ def build_master(frames, status, us10y, market_hist, taiex, chips,
                           (df["dps"] / price * 100).round(2), np.nan)
     df["殖利率差異(pp)"] = (df["殖利率"] - df["殖利率_官方"]).round(2)
 
+    df = M.industry_valuation(df)
     df = M.composite_score(df)
     df["風險標記"] = df.apply(lambda r: M.risk_flags(r, penalty), axis=1)
     df = M.apply_risk_penalty(df)
@@ -320,6 +329,11 @@ COLUMNS = [
     ("合理價", "5 年平均股利 ÷ 門檻", "—", "—", "現價 ≤ 合理價＝可考慮"),
     ("昂貴價", "5 年平均股利 ÷ max(門檻×0.8, 2%)", "—", "—", "現價 > 昂貴價＝暫緩"),
     ("股價位階", "現價對應便宜/合理/昂貴", "—", "—", "用 5 年平均股利，不用單一年度"),
+    ("同業估值位階", "同產業內 PE/PB/殖利率的綜合位階", "💚 同業便宜", "🔴 同業昂貴", "同產業 <5 檔不給位階；避免跨產業比 PER"),
+    ("同業估值分", "同業殖利率/PE/PB 位階平均（0–100）", "同業最便宜", "同業最貴", "100＝殖利率最高且 PE/PB 最低"),
+    ("PE_同業中位數", "同產業 PE 中位數", "—", "—", "與自身 PE 對照，判斷是低估還是弱勢"),
+    ("PB_同業中位數", "同產業 PB 中位數", "—", "—", "低 PB 可能反映賽道弱勢，不一定是便宜"),
+    ("殖利率_同業中位數", "同產業殖利率中位數", "—", "—", "高於中位數才是相對收益優勢"),
     ("綜合分數", "估值 35%＋品質 35%＋籌碼 15%＋動能 15%（rank 百分位）", "各方面都前段", "後段", "本次主要排序指標；覆蓋率 <50% 不給分"),
     ("估值分", "安全邊際/殖利率/PE/PB 的 rank 平均", "便宜", "貴", "0–100"),
     ("品質分", "ROE/負債比/毛利率/業外/配息穩定 rank 平均", "體質好", "體質差", "0–100"),

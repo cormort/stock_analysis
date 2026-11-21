@@ -38,6 +38,7 @@ python3 stock_screener.py --seed ~/.hermes/profiles/bot2/workspace/cache/dividen
 | PE / PB / 官方殖利率 | TWSE `BWIBBU_ALL` | PE 為 TTM；官方殖利率的基準年度可能與今年宣告不同，**只用來對帳** |
 | 收盤價 | TWSE `STOCK_DAY_AVG_ALL` | 最近交易日 |
 | 股利（20+ 年） | Yahoo `chart?events=div` | 以**除息日**為準；`dps` = 近 365 天實際除息總和（年配若時序漂移，取 500 天內最近一次） |
+| 股利 fallback | TWSE `t187ap45_L` | **只接受完整年度**（`0101~1231`）；季配/半年配在 TWSE 只有最近幾季，寧可留 null 也不把單季當年度 |
 | 5 年平均股利 | 同上 | 最近 5 個**完整年度**（不足 3 年覆蓋 → 空白，不假裝穩定） |
 | 年度 EPS / 成長率 | Yahoo `annualBasicEPS` | 免費層僅約 4 年；`連續獲利年數` 是**下限**，不是完整歷史 |
 | 品質（負債比/三率/淨值） | TWSE `t187ap07_L_ci`、`t187ap06_L_ci` | 單季累計快照，不是歷史趨勢 |
@@ -54,10 +55,13 @@ python3 stock_screener.py --seed ~/.hermes/profiles/bot2/workspace/cache/dividen
 
 `綜合分數` = 估值 35% + 品質 35% + 籌碼 15% + 動能 15%，每個因子先做**橫斷面 rank 百分位**再加權（不是把不同量綱的數字相加）。
 
-- 估值：安全邊際、殖利率、PE（低）、PB（低）
+- 估值：安全邊際、殖利率、PE（低）、PB（低）、同業估值位階
 - 品質：ROE、負債比（低）、毛利率、業外依賴（低）、連續配息、股利穩定
 - 籌碼：外資持股 5 日變化、法人 20 日買超 / 日均量、外資持股率
 - 動能：RS20（相對大盤）、距 60 日高點、量比
+
+估值同時看「絕對」與「相對」：`同業估值位階` 是同一產業內 PE/PB/殖利率的綜合百分位
+（同產業 <5 檔不給位階），避免跨產業比 PER 的謬誤。
 
 風險標記會直接從分數扣分（股利衰退 −8、獲利衰退 −10、建商 −8、負債偏高 −6、業外依賴 −5…），
 所以「便宜但有問題」不會排在清單最前面；扣分後仍保留在清單並顯示原因，不靜默消失。
@@ -74,15 +78,43 @@ python3 stock_screener.py --seed ~/.hermes/profiles/bot2/workspace/cache/dividen
 
 KY 股、違規裁處、日均量 <500 張會直接排除；其餘風險只標記，不靜默消失。
 
+## API（給 cron／其他工具用）
+
+`server.py` 除了靜態頁，還提供唯讀 JSON（只綁 127.0.0.1）：
+
+```bash
+curl http://localhost:8000/api/health
+curl -G http://localhost:8000/api/analysis \
+  --data-urlencode "codes=2317,2330" \
+  --data-urlencode "fields=Name,收盤價,殖利率,綜合分數,同業估值位階"
+curl -G http://localhost:8000/api/screen \
+  --data-urlencode "sheet=value" -d limit=10 --data-urlencode "sort=綜合分數"
+```
+
+- `/api/analysis` 回傳 `{generated_at, data_date, stocks:{代號: {...}}}`；找不到的代號會標 `not_found`。
+- `/api/screen` 支援 `sheet=value|sheet1|sheet2|all`、`limit`、`sort`、`asc=1`。
+- `/api/quote` 仍為上市即時報價代理。
+
+## 驗收
+
+```bash
+python3 validate.py          # 最新快照
+python3 validate.py data/snapshot_xxx.json
+```
+
+檢查：全市場筆數、股利/品質/籌碼/技術覆蓋率、0 與 null 是否混用、2317 配息年數與殖利率口徑、
+`綜合分數` 是否退化成 PB 倒數（|Spearman|<0.5）、價值清單是否符合自身門檻。有 FAIL 時 exit 1。
+
 ## 檔案
 
 ```
 stock_screener.py   主流程（抓取 → 合併 → 篩選 → 快照）
 stock_sources.py    TWSE / Yahoo 資料源與逐日快取
-stock_metrics.py    純計算（股利 streak、估值、品質、技術、rank 評分）
-server.py           靜態檔 + /api/quote（上市即時報價代理）
+stock_metrics.py    純計算（股利 streak、估值、品質、技術、同業位階、rank 評分）
+server.py           靜態檔 + /api/analysis /api/screen /api/quote
+validate.py         快照驗收（CI 可用）
 index.html          報告檢視（響應式；窄視窗個股追蹤改上下排列）
-tests/              pytest（不打網路）
+tests/              pytest（23 個，不打網路）
 finmind_source.py   v5 遺留，v6 未使用（FinMind 免費額度易耗盡）
 ```
 

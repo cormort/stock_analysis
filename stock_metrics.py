@@ -284,10 +284,41 @@ def valuation_metrics(dps, five_avg, price, us10y, premium: float | None = None)
 
 
 # ───────────────────────────────────────────
+# 同業相對估值（單一快照就能算，不需歷史）
+# ───────────────────────────────────────────
+def industry_valuation(df: pd.DataFrame, min_peers: int = 5) -> pd.DataFrame:
+    """在同產業內比較 PE / PB / 殖利率，避免跨產業比 PER 的謬誤。
+
+    位階 0–100：100 = 同業最便宜（殖利率最高、PE/PB 最低）。
+    同業家數 < min_peers → 不給位階（樣本不足）。
+    """
+    if "產業" not in df.columns or df.empty:
+        return df
+    n = df.groupby("產業")["代號"].transform("count")
+    parts = {}
+    for col in ("殖利率", "PE", "PB"):
+        s = pd.to_numeric(df[col], errors="coerce")
+        higher_is_better = col == "殖利率"
+        parts[f"{col}_同業中位數"] = df.assign(_s=s).groupby("產業")["_s"].transform("median").round(2)
+        parts[f"{col}_同業位階"] = df.assign(_s=s).groupby("產業")["_s"].rank(
+            pct=True, ascending=higher_is_better).mul(100).round(0)
+    out = pd.DataFrame(parts, index=df.index)
+    out["同業估值分"] = out[["殖利率_同業位階", "PE_同業位階", "PB_同業位階"]].mean(axis=1).round(1)
+    out.loc[n < min_peers, "同業估值分"] = np.nan
+    cond = [out["同業估值分"] >= 75, out["同業估值分"] >= 50,
+            out["同業估值分"] >= 25, out["同業估值分"] < 25]
+    out["同業估值位階"] = np.select(cond, ["💚 同業便宜", "💛 同業合理",
+                                       "🟠 同業偏貴", "🔴 同業昂貴"], default="—")
+    out.loc[n < min_peers, "同業估值位階"] = "—"
+    return pd.concat([df, out], axis=1)
+
+
+# ───────────────────────────────────────────
 # 綜合評分（rank-based，解決量綱與 PB 代理問題）
 # ───────────────────────────────────────────
 WEIGHTS = {
-    "安全邊際%": (0.12, True), "殖利率": (0.10, True), "PE": (0.07, False), "PB": (0.06, False),
+    "安全邊際%": (0.10, True), "殖利率": (0.09, True), "PE": (0.06, False), "PB": (0.04, False),
+    "同業估值分": (0.06, True),
     "ROE%": (0.10, True), "負債比%": (0.07, False), "毛利率%": (0.06, True),
     "業外依賴度": (0.05, False), "連續配發現金股利年數": (0.04, True),
     "股利穩定距離": (0.03, False),
