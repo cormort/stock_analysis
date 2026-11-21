@@ -1,0 +1,656 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>台股存股選股器 — 報告檢視</title>
+<script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #f4f6fa; --panel: #ffffff; --ink: #1f2733; --muted: #6b7785;
+    --line: #e2e8f2; --accent: #2f5496; --value: #7b2d8b; --defend: #375623;
+    --good: #1a8a4a; --bad: #c0392b; --star: #f2b500;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: "Microsoft JhengHei", "PingFang TC", system-ui, sans-serif;
+    background: var(--bg); color: var(--ink); font-size: 14px;
+  }
+  header {
+    background: linear-gradient(95deg, var(--accent), var(--value));
+    color: #fff; padding: 14px 22px; display: flex; align-items: center;
+    gap: 18px; flex-wrap: wrap; box-shadow: 0 2px 8px rgba(0,0,0,.12);
+  }
+  header h1 { font-size: 18px; margin: 0; font-weight: 700; letter-spacing: .5px; }
+  .meta { font-size: 12.5px; opacity: .92; }
+  .meta b { font-weight: 700; }
+  .toolbar {
+    background: var(--panel); padding: 10px 22px; display: flex; gap: 10px;
+    align-items: center; flex-wrap: wrap; border-bottom: 1px solid var(--line);
+  }
+  .toolbar label { font-size: 12.5px; color: var(--muted); }
+  select, input[type=text], button {
+    font: inherit; padding: 6px 10px; border: 1px solid var(--line);
+    border-radius: 7px; background: #fff; color: var(--ink);
+  }
+  input[type=text] { min-width: 180px; }
+  button { cursor: pointer; background: var(--accent); color: #fff; border: none; font-weight: 600; }
+  button.ghost { background: #eef2f9; color: var(--accent); }
+  button:hover { filter: brightness(1.06); }
+  .spacer { flex: 1; }
+  .tabs { display: flex; gap: 4px; padding: 10px 22px 0; flex-wrap: wrap; }
+  .tab {
+    padding: 8px 16px; border-radius: 9px 9px 0 0; cursor: pointer;
+    background: #e7ecf5; color: var(--muted); font-weight: 600; border: 1px solid transparent;
+    border-bottom: none; font-size: 13.5px;
+  }
+  .tab.active { background: var(--panel); color: var(--ink); border-color: var(--line); }
+  .panel { background: var(--panel); margin: 0 22px 22px; border: 1px solid var(--line);
+    border-radius: 0 9px 9px 9px; overflow: hidden; }
+  .panel-head { display: flex; align-items: center; gap: 14px; padding: 10px 16px;
+    border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+  .badge { font-size: 12px; color: var(--muted); }
+  .criteria { font-size: 11.5px; color: var(--muted); }
+  .table-wrap { overflow: auto; max-height: calc(100vh - 290px); }
+  table { border-collapse: collapse; width: 100%; white-space: nowrap; }
+  th, td { padding: 7px 11px; text-align: center; border-bottom: 1px solid var(--line); }
+  thead th {
+    position: sticky; top: 0; background: var(--accent); color: #fff; cursor: pointer;
+    user-select: none; font-size: 12.5px; z-index: 2;
+  }
+  thead th.sorted::after { content: " \25B2"; font-size: 9px; }
+  thead th.sorted.desc::after { content: " \25BC"; }
+  tbody tr:nth-child(even) { background: #f7f9fc; }
+  tbody tr:hover { background: #eef4ff; }
+  td.txt { text-align: left; }
+  .pos { color: var(--good); font-weight: 600; }
+  .neg { color: var(--bad); font-weight: 600; }
+  .star { cursor: pointer; color: #ccd2dc; font-size: 16px; }
+  .star.on { color: var(--star); }
+  .defs td { text-align: left; white-space: normal; vertical-align: top; line-height: 1.5; }
+  .defs td:last-child { color: #b15a14; }
+  .empty { padding: 40px; text-align: center; color: var(--muted); }
+  .hint { background: #fff7e6; border: 1px solid #ffe0a3; color: #8a6100;
+    padding: 8px 14px; border-radius: 8px; margin: 12px 22px; font-size: 12.5px; }
+  thead th.has-tip { text-decoration: underline dotted rgba(255,255,255,.6); text-underline-offset: 3px; }
+  .col-tip { position: fixed; z-index: 50; max-width: 330px; background: #1f2733; color: #fff;
+    padding: 10px 13px; border-radius: 9px; font-size: 12px; line-height: 1.65;
+    box-shadow: 0 6px 22px rgba(0,0,0,.28); pointer-events: none; }
+  .col-tip .tip-t { font-weight: 700; font-size: 13px; margin-bottom: 5px; color: #9ecbff; }
+  .col-tip .tip-d { margin-bottom: 4px; }
+  .col-tip .tip-line { color: #d6dde8; }
+  .col-tip .tip-r { margin-top: 6px; padding-top: 6px; border-top: 1px solid #3a4453; color: #ffd98a; }
+  /* ── 個股追蹤 ── */
+  .track-wrap { display: flex; min-height: 420px; }
+  .track-list { width: 220px; border-right: 1px solid var(--line); flex-shrink: 0;
+    max-height: calc(100vh - 240px); overflow: auto; }
+  .track-add { padding: 10px; border-bottom: 1px solid var(--line); }
+  .track-add input { width: 100%; }
+  .track-list ul { list-style: none; margin: 0; padding: 0; }
+  .track-list li { padding: 9px 14px; cursor: pointer; border-bottom: 1px solid #f0f3f8; font-size: 13px; }
+  .track-list li:hover { background: #eef4ff; }
+  .track-list li.sel { background: #e6ecfa; color: var(--accent); font-weight: 700; }
+  .track-list li.muted { color: var(--muted); cursor: default; font-size: 12px; }
+  .track-detail { flex: 1; padding: 16px 20px; overflow: auto; max-height: calc(100vh - 240px); }
+  .track-detail h2 { margin: 6px 0 12px; font-size: 17px; }
+  .cards { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
+  .card { background: #f7f9fc; border: 1px solid var(--line); border-radius: 10px;
+    padding: 9px 13px; min-width: 120px; }
+  .card-m { font-size: 11.5px; color: var(--muted); }
+  .card-v { font-size: 19px; font-weight: 700; margin: 2px 0; }
+  .card-d { font-size: 11px; color: var(--muted); }
+  .chips { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
+  .chip { padding: 5px 12px; border-radius: 16px; background: #eef2f9; color: var(--muted);
+    cursor: pointer; font-size: 12.5px; font-weight: 600; }
+  .chip.on { background: var(--accent); color: #fff; }
+  .chart-box { height: 280px; margin-bottom: 16px; }
+  .arrow-up { color: var(--good); } .arrow-dn { color: var(--bad); }
+  .io-card { background: #f7f9fc; border: 1px solid var(--line); border-radius: 10px;
+    padding: 10px 14px; margin-bottom: 16px; font-size: 12.5px; }
+  .io-title { font-weight: 700; margin-bottom: 6px; }
+  .io-row { display: flex; gap: 10px; padding: 3px 0; flex-wrap: wrap; }
+  .io-k { font-weight: 700; min-width: 56px; }
+  .io-in { color: var(--good); } .io-out { color: var(--bad); }
+</style>
+</head>
+<body>
+<header>
+  <h1>📊 台股存股選股器</h1>
+  <div class="meta" id="metaInfo">尚未載入資料</div>
+</header>
+
+<div class="toolbar">
+  <label>歷史快照</label>
+  <select id="snapSelect"><option value="">（無）</option></select>
+  <button class="ghost" id="importBtn">📥 匯入 JSON</button>
+  <input type="file" id="fileInput" accept="application/json" hidden>
+  <button id="exportBtn">📤 匯出 xlsx</button>
+  <div class="spacer"></div>
+  <input type="text" id="search" placeholder="🔍 搜尋代號 / 名稱…">
+  <label><input type="checkbox" id="onlyWatch"> 只看自選 ⭐</label>
+</div>
+
+<div id="loadHint" class="hint" style="display:none"></div>
+
+<div class="tabs" id="tabs"></div>
+<div class="panel" id="tablePanel">
+  <div class="panel-head">
+    <span class="badge" id="rowCount">—</span>
+    <span class="criteria" id="criteria"></span>
+  </div>
+  <div class="table-wrap"><table><thead id="thead"></thead><tbody id="tbody"></tbody></table></div>
+  <div class="empty" id="emptyMsg" style="display:none">尚無資料 — 請從上方「匯入 JSON」載入快照，或先執行 stock_screener.py 產生 data/ 快照。</div>
+</div>
+<div class="panel" id="trackPanel" style="display:none">
+  <div class="track-wrap">
+    <aside class="track-list">
+      <div class="track-add"><input type="text" id="trackAdd" placeholder="➕ 加入代號後按 Enter"></div>
+      <ul id="watchList"></ul>
+    </aside>
+    <section class="track-detail" id="trackDetail">
+      <div class="empty">選擇左側 ⭐ 自選股票以檢視走勢</div>
+    </section>
+  </div>
+</div>
+
+<script>
+const SHEETS = [
+  { key: 'value',  label: '💎 價值投資精選' },
+  { key: 'sheet1', label: '📈 廣泛價值清單' },
+  { key: 'sheet2', label: '🛡️ 嚴選防禦存股' },
+  { key: 'all',    label: '🌐 全市場' },
+  { key: 'core',      label: '🎯 核心候選' },
+  { key: 'satellite', label: '🛰️ 衛星候選' },
+  { key: 'defs',   label: '📖 欄位說明' },
+  { key: 'track',  label: '📈 個股追蹤' },
+];
+const TRACK_METRICS = ['收盤價', '殖利率', '投資CP值', '安全邊際%', '盈餘發放率%', 'PE'];
+
+// 核心/衛星雙池：皆衍生自〈價值投資精選〉
+const CORE_RULES = { 連續配發現金股利年數: 10, 連續獲利年數: 10, 溢價回收年限: 10, 殖利率: 5 };
+const SATELLITE_TOPN = 30;
+const _n = v => { const x = parseFloat(v); return isNaN(x) ? NaN : x; };
+function valueRows() { return (snapshot && snapshot.sheets.value && snapshot.sheets.value.rows) || []; }
+function byCpDesc(a, b) { return (_n(b['投資CP值']) || -1e9) - (_n(a['投資CP值']) || -1e9); }
+function deriveCore(rows) {
+  return rows.filter(r =>
+    _n(r['連續配發現金股利年數']) >= CORE_RULES['連續配發現金股利年數'] &&
+    _n(r['連續獲利年數'])       >= CORE_RULES['連續獲利年數'] &&
+    _n(r['溢價回收年限'])       <= CORE_RULES['溢價回收年限'] &&
+    _n(r['殖利率'])             >= CORE_RULES['殖利率']
+  ).slice().sort(byCpDesc);
+}
+function deriveSatellite(rows) {
+  const coreSet = new Set(deriveCore(rows).map(r => String(r['代號'])));
+  return rows.slice().sort(byCpDesc).slice(0, SATELLITE_TOPN)
+             .filter(r => !coreSet.has(String(r['代號'])));
+}
+const WATCH_KEY = 'twstock_watchlist';
+const SNAP_STORE = 'twstock_snapshots_v1'; // 個股追蹤基礎：累積歷史快照於瀏覽器
+
+let snapshot = null;          // 目前載入的快照物件
+let activeTab = 'value';
+let sortState = { col: null, dir: 1 };
+let watch = new Set(JSON.parse(localStorage.getItem(WATCH_KEY) || '[]'));
+// 個股追蹤狀態
+let manifestList = [];        // data/manifest.json 的快照清單
+let historyCache = {};        // generated_at -> 完整快照（追蹤用，含 data/ 與匯入）
+let trackHistory = [];        // 排序後（舊→新）的歷史快照陣列
+let selectedTrackCode = null;
+let trackMetric = '收盤價';
+let trendChart = null;
+
+// ---- 快照儲存（localStorage，供日後跨快照追蹤） ----
+function storedSnapshots() {
+  try { return JSON.parse(localStorage.getItem(SNAP_STORE) || '{}'); }
+  catch { return {}; }
+}
+function rememberSnapshot(snap) {
+  const all = storedSnapshots();
+  all[snap.generated_at] = snap;
+  // 僅保留最近 10 份，避免超出 localStorage 容量
+  const keys = Object.keys(all).sort().reverse();
+  keys.slice(10).forEach(k => delete all[k]);
+  try { localStorage.setItem(SNAP_STORE, JSON.stringify(all)); } catch (e) { /* 容量滿則略過 */ }
+}
+
+// ---- 載入：優先讀 data/manifest.json，失敗則提示手動匯入 ----
+async function init() {
+  buildTabs();
+  let manifestOk = false;
+  try {
+    const r = await fetch('data/manifest.json', { cache: 'no-store' });
+    if (r.ok) {
+      const m = await r.json();
+      manifestList = m.snapshots || [];
+      populateSelect(manifestList, true);
+      manifestOk = manifestList.length > 0;
+      if (manifestOk) loadFromData(manifestList[0].file);
+    }
+  } catch (e) { /* file:// 或無伺服器 */ }
+
+  // 併入 localStorage 中曾匯入的快照（data/ 已有者略過，避免重複）
+  const inData = new Set(manifestList.map(s => s.generated_at));
+  const stored = Object.values(storedSnapshots()).filter(s => !inData.has(s.generated_at))
+    .sort((a,b) => b.generated_at.localeCompare(a.generated_at));
+  if (stored.length) {
+    stored.forEach(s => addSelectOption(s.generated_at, '💾 ' + s.generated_at_display + '（瀏覽器）'));
+    if (!manifestOk) { render(stored[0]); }
+  }
+
+  if (!manifestOk && !stored.length) {
+    showHint('未讀到 data/manifest.json。請用 <b>python3 -m http.server</b> 啟動後開 http://localhost:8000，或點「匯入 JSON」手動載入。');
+    document.getElementById('emptyMsg').style.display = 'block';
+  }
+}
+
+function showHint(html) {
+  const h = document.getElementById('loadHint');
+  h.innerHTML = html; h.style.display = 'block';
+}
+
+async function loadFromData(file) {
+  try {
+    const r = await fetch('data/' + file, { cache: 'no-store' });
+    render(await r.json());
+  } catch (e) { showHint('讀取 data/' + file + ' 失敗：' + e.message); }
+}
+
+function populateSelect(snaps, fromData) {
+  const sel = document.getElementById('snapSelect');
+  sel.innerHTML = '';
+  snaps.forEach(s => addSelectOption('file:' + s.file, '📁 ' + s.generated_at_display +
+    `（💎${s.counts.value} 📈${s.counts.sheet1} 🛡️${s.counts.sheet2}${s.counts.all ? ' 🌐' + s.counts.all : ''}）`));
+}
+function addSelectOption(value, text) {
+  const sel = document.getElementById('snapSelect');
+  const o = document.createElement('option');
+  o.value = value; o.textContent = text; sel.appendChild(o);
+}
+
+// ---- 渲染 ----
+function buildTabs() {
+  const t = document.getElementById('tabs');
+  t.innerHTML = '';
+  SHEETS.forEach(s => {
+    const el = document.createElement('div');
+    el.className = 'tab' + (s.key === activeTab ? ' active' : '');
+    el.textContent = s.label;
+    el.onclick = () => { activeTab = s.key; sortState = {col:null,dir:1}; buildTabs(); refreshView(); };
+    t.appendChild(el);
+  });
+}
+
+function refreshView() {
+  const isTrack = activeTab === 'track';
+  document.getElementById('tablePanel').style.display = isTrack ? 'none' : '';
+  document.getElementById('trackPanel').style.display = isTrack ? '' : 'none';
+  if (isTrack) renderTrack(); else renderTable();
+}
+
+function render(snap) {
+  snapshot = snap;
+  document.getElementById('loadHint').style.display = 'none';
+  document.getElementById('emptyMsg').style.display = 'none';
+  const tw = snap.twstock_enabled ? '✅ 含個股分析' : '❌ 未含 twstock';
+  const gi = snap.history_enriched ? '✅ FinMind 多年股利/獲利' : '📅 TWSE 近2年股利';
+  document.getElementById('metaInfo').innerHTML =
+    `🕒 產生時間 <b>${snap.generated_at_display}</b> ｜ v${snap.screener_version} ｜ ${tw} ｜ ${gi}`;
+  refreshView();
+}
+
+function currentRows() {
+  if (!snapshot) return { cols: [], rows: [] };
+  if (activeTab === 'defs') {
+    const rows = snapshot.column_definitions || [];
+    return { cols: rows.length ? Object.keys(rows[0]) : [], rows, isDefs: true };
+  }
+  if (activeTab === 'core' || activeTab === 'satellite') {
+    const base = valueRows();
+    const rows = activeTab === 'core' ? deriveCore(base) : deriveSatellite(base);
+    const cols = (rows[0] || base[0]) ? Object.keys(rows[0] || base[0]) : [];
+    return { cols, rows };
+  }
+  const sh = snapshot.sheets[activeTab];
+  const rows = sh ? sh.rows : [];
+  return { cols: rows.length ? Object.keys(rows[0]) : [], rows };
+}
+
+function renderTable() {
+  const { cols, rows, isDefs } = currentRows();
+  const thead = document.getElementById('thead');
+  const tbody = document.getElementById('tbody');
+  thead.innerHTML = ''; tbody.innerHTML = '';
+  hideColTip();
+  const defMap = colDefMap();
+
+  // 篩選與排序
+  let view = rows.slice();
+  const q = document.getElementById('search').value.trim().toLowerCase();
+  if (!isDefs && q) view = view.filter(r =>
+    String(r['代號']).toLowerCase().includes(q) || String(r['Name']||'').toLowerCase().includes(q));
+  if (!isDefs && document.getElementById('onlyWatch').checked)
+    view = view.filter(r => watch.has(String(r['代號'])));
+  if (sortState.col) {
+    const c = sortState.col, d = sortState.dir;
+    view.sort((a,b) => {
+      let x = a[c], y = b[c];
+      const nx = parseFloat(x), ny = parseFloat(y);
+      if (!isNaN(nx) && !isNaN(ny)) return (nx-ny)*d;
+      return String(x).localeCompare(String(y), 'zh-Hant')*d;
+    });
+  }
+
+  // 表頭
+  const htr = document.createElement('tr');
+  if (!isDefs) htr.appendChild(document.createElement('th')); // ⭐ 欄
+  cols.forEach(c => {
+    const th = document.createElement('th');
+    th.textContent = c;
+    const cls = [];
+    if (c === sortState.col) cls.push('sorted', sortState.dir < 0 ? 'desc' : '');
+    const def = !isDefs ? defMap[normName(c)] : null;
+    if (def) {
+      cls.push('has-tip');
+      th.onmouseenter = () => showColTip(th, def);
+      th.onmouseleave = hideColTip;
+    }
+    th.className = cls.join(' ').trim();
+    if (!isDefs) th.onclick = () => {
+      hideColTip();
+      sortState = { col: c, dir: (sortState.col===c ? -sortState.dir : 1) };
+      renderTable();
+    };
+    htr.appendChild(th);
+  });
+  thead.appendChild(htr);
+
+  // 內文
+  const frag = document.createDocumentFragment();
+  view.forEach(r => {
+    const tr = document.createElement('tr');
+    if (!isDefs) {
+      const code = String(r['代號']);
+      const stTd = document.createElement('td');
+      const st = document.createElement('span');
+      st.className = 'star' + (watch.has(code)?' on':''); st.textContent = '★';
+      st.onclick = () => { watch.has(code)?watch.delete(code):watch.add(code);
+        localStorage.setItem(WATCH_KEY, JSON.stringify([...watch])); renderTable(); };
+      stTd.appendChild(st); tr.appendChild(stTd);
+    }
+    cols.forEach(c => {
+      const td = document.createElement('td');
+      const v = r[c];
+      td.textContent = (v===null||v===undefined) ? '—' : v;
+      if (isDefs) td.className = 'txt';
+      else if (c === '代號' || c === 'Name') td.className = 'txt';
+      else if ((c.includes('%')||c==='投資CP值') && typeof v === 'number')
+        td.className = v>0?'pos':(v<0?'neg':'');
+      tr.appendChild(td);
+    });
+    frag.appendChild(tr);
+  });
+  tbody.appendChild(frag);
+
+  document.getElementById('rowCount').textContent =
+    isDefs ? `${view.length} 個欄位說明` : `共 ${view.length} 檔（總 ${rows.length}）`;
+  let critText = '';
+  if (activeTab === 'core')
+    critText = '核心候選：連續配息 ≥ 10 年 且 連續獲利 ≥ 10 年 且 溢價回收 ≤ 10 年 且 殖利率 ≥ 5%，依投資CP值由高到低';
+  else if (activeTab === 'satellite')
+    critText = `衛星候選：價值精選依投資CP值前 ${SATELLITE_TOPN} 名中，未進入核心池者`;
+  else if (activeTab === 'all')
+    critText = snapshot.sheets.all ? '全市場未篩選（可搜尋、排序、勾「只看自選」）'
+                                   : '此快照為舊版，未含全市場資料 — 請重新執行 stock_screener.py';
+  else {
+    const sh = (!isDefs && snapshot) ? snapshot.sheets[activeTab] : null;
+    if (sh) critText = '篩選條件：' + JSON.stringify(sh.criteria, null, 0).replace(/[{}"]/g, '').replace(/,/g, '  ');
+  }
+  document.getElementById('criteria').textContent = critText;
+}
+
+// ---- 欄位說明 tooltip ----
+// 欄名正規化：去空白、去括號內容、去 %，讓 'PE'↔'PE (本益比)'、'安全邊際%'↔'安全邊際%' 都能對上
+const normName = s => String(s).replace(/\s+/g, '').replace(/[（(][^）)]*[)）]/g, '').replace(/%/g, '');
+
+function colDefMap() {
+  const map = {};
+  (snapshot && snapshot.column_definitions || []).forEach(d => { map[normName(d['欄位名稱'])] = d; });
+  return map;
+}
+
+let _tipEl = null;
+function _tip() {
+  if (!_tipEl) { _tipEl = document.createElement('div'); _tipEl.className = 'col-tip';
+    _tipEl.style.display = 'none'; document.body.appendChild(_tipEl); }
+  return _tipEl;
+}
+function hideColTip() { if (_tipEl) _tipEl.style.display = 'none'; }
+function showColTip(th, d) {
+  const t = _tip();
+  let h = `<div class="tip-t">${d['欄位名稱']}</div><div class="tip-d">${d['定義']}</div>`;
+  if (d['數值越大代表'] && d['數值越大代表'] !== '—') h += `<div class="tip-line">📈 越大：${d['數值越大代表']}</div>`;
+  if (d['數值越小代表'] && d['數值越小代表'] !== '—') h += `<div class="tip-line">📉 越小：${d['數值越小代表']}</div>`;
+  if (d['存股參考']) h += `<div class="tip-r">${d['存股參考']}</div>`;
+  t.innerHTML = h;
+  t.style.display = 'block';
+  const r = th.getBoundingClientRect(), tr = t.getBoundingClientRect();
+  let top = r.top - tr.height - 8;
+  if (top < 4) top = r.bottom + 8;                       // 上方放不下就改放下方
+  let left = Math.min(r.left, window.innerWidth - tr.width - 8);
+  t.style.top = top + 'px';
+  t.style.left = Math.max(8, left) + 'px';
+}
+
+// ---- 個股追蹤 ----
+async function loadAllHistory() {
+  // 依 manifest 把 data/ 下所有快照載入快取（已載入者略過）
+  await Promise.all(manifestList.filter(s => !historyCache[s.generated_at]).map(async s => {
+    try {
+      const r = await fetch('data/' + s.file);
+      if (r.ok) { const snap = await r.json(); historyCache[snap.generated_at] = snap; }
+    } catch (e) { /* 略過抓不到的 */ }
+  }));
+  // 併入 localStorage 曾匯入的快照（不覆蓋已有）
+  Object.values(storedSnapshots()).forEach(snap => {
+    if (!historyCache[snap.generated_at]) historyCache[snap.generated_at] = snap;
+  });
+  // 目前畫面這份也納入
+  if (snapshot && !historyCache[snapshot.generated_at]) historyCache[snapshot.generated_at] = snapshot;
+  return Object.values(historyCache).sort((a, b) => a.generated_at.localeCompare(b.generated_at));
+}
+
+function rowForCode(snap, code) {
+  for (const k of ['value', 'sheet1', 'sheet2', 'all']) {  // all 放最後：清單列可能含 twstock 欄位
+    const sh = snap.sheets[k];
+    if (!sh) continue;
+    const hit = sh.rows.find(r => String(r['代號']) === code);
+    if (hit) return hit;
+  }
+  return null;
+}
+function nameOf(snap, code) { const r = rowForCode(snap, code); return r ? (r['Name'] || '') : ''; }
+function seriesForCode(code) {
+  return trackHistory
+    .map(snap => ({ t: snap.generated_at_display, row: rowForCode(snap, code) }))
+    .filter(p => p.row);
+}
+const num = v => { const n = parseFloat(v); return isNaN(n) ? null : n; };
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => `&#${c.charCodeAt(0)};`);
+
+async function renderTrack() {
+  document.getElementById('watchList').innerHTML = '<li class="muted">載入歷史快照中…</li>';
+  trackHistory = await loadAllHistory();
+  renderWatchList();
+  renderTrackDetail();
+}
+
+function renderWatchList() {
+  const ul = document.getElementById('watchList');
+  ul.innerHTML = '';
+  const latest = trackHistory.length ? trackHistory[trackHistory.length - 1] : snapshot;
+  const codes = [...watch].sort();
+  if (!codes.length) { ul.innerHTML = '<li class="muted">尚無自選。到任一清單分頁點 ★ 加入。</li>'; return; }
+  codes.forEach(code => {
+    const li = document.createElement('li');
+    li.textContent = `★ ${code} ${latest ? nameOf(latest, code) : ''}`;
+    if (code === selectedTrackCode) li.className = 'sel';
+    li.onclick = () => { selectedTrackCode = code; renderWatchList(); renderTrackDetail(); };
+    ul.appendChild(li);
+  });
+}
+
+function inOutLatest() {
+  if (trackHistory.length < 2) return null;
+  const cur = trackHistory[trackHistory.length - 1], prev = trackHistory[trackHistory.length - 2];
+  const codesOf = (snap, k) => new Set((snap.sheets[k] ? snap.sheets[k].rows : []).map(r => String(r['代號'])));
+  const result = {};
+  ['value', 'sheet1', 'sheet2'].forEach(k => {
+    const c = codesOf(cur, k), p = codesOf(prev, k);
+    result[k] = { entered: [...c].filter(x => !p.has(x)), dropped: [...p].filter(x => !c.has(x)) };
+  });
+  return { cur, prev, result };
+}
+function inOutHtml(io) {
+  const labels = { value: '💎精選', sheet1: '📈廣泛', sheet2: '🛡️防禦' };
+  const list = (codes, snap) => codes.length ? codes.map(c => esc(`${c} ${nameOf(snap, c)}`)).join('、') : '—';
+  const rows = ['value', 'sheet1', 'sheet2'].map(k =>
+    `<div class="io-row"><span class="io-k">${labels[k]}</span>` +
+    `<span class="io-in">新進 ${list(io.result[k].entered, io.cur)}</span>` +
+    `<span class="io-out">退榜 ${list(io.result[k].dropped, io.prev)}</span></div>`).join('');
+  return `<div class="io-card"><div class="io-title">🔀 進出榜（${io.prev.generated_at_display} → ${io.cur.generated_at_display}）</div>${rows}</div>`;
+}
+
+function fmtDelta(x) {
+  if (x === null) return '—';
+  const cls = x > 0 ? 'arrow-up' : (x < 0 ? 'arrow-dn' : '');
+  const sym = x > 0 ? '▲' : (x < 0 ? '▼' : '＝');
+  return `<span class="${cls}">${sym}${Math.abs(x).toFixed(2)}</span>`;
+}
+function cardHtml(m, first, prev, last) {
+  const lv = num(last[m]), pv = num(prev[m]), fv = num(first[m]);
+  const d = (a, b) => (a === null || b === null) ? '—' : fmtDelta(a - b);
+  return `<div class="card"><div class="card-m">${m}</div>` +
+    `<div class="card-v">${lv === null ? '—' : lv}</div>` +
+    `<div class="card-d">較前次 ${d(lv, pv)}　較首次 ${d(lv, fv)}</div></div>`;
+}
+function trendTableHtml(series) {
+  const head = '<tr><th>快照時間</th>' + TRACK_METRICS.map(m => `<th>${m}</th>`).join('') + '<th>股價位階</th></tr>';
+  const body = series.map(p => '<tr><td class="txt">' + p.t + '</td>' +
+    TRACK_METRICS.map(m => `<td>${esc(p.row[m] ?? '—')}</td>`).join('') +
+    `<td>${esc(p.row['股價位階'] ?? '—')}</td></tr>`).join('');
+  return `<div class="table-wrap"><table><thead>${head}</thead><tbody>${body}</tbody></table></div>`;
+}
+
+function renderTrackDetail() {
+  const detail = document.getElementById('trackDetail');
+  let html = '';
+  const io = inOutLatest();
+  if (io) html += inOutHtml(io);
+
+  if (trackHistory.length < 2) {
+    detail.innerHTML = (html || '') +
+      '<div class="empty">需至少 2 份快照才能比較走勢。請定期執行選股器累積歷史。</div>';
+    return;
+  }
+  if (!selectedTrackCode) {
+    detail.innerHTML = html + '<div class="empty">點左側 ⭐ 清單中的股票檢視走勢</div>';
+    return;
+  }
+  const series = seriesForCode(selectedTrackCode);
+  if (series.length < 2) {
+    detail.innerHTML = html +
+      `<div class="empty">${esc(selectedTrackCode)} 在歷史快照中出現少於 2 次，暫無走勢可比較。</div>`;
+    return;
+  }
+  const first = series[0].row, last = series[series.length - 1].row, prev = series[series.length - 2].row;
+  html += `<h2>${esc(selectedTrackCode)} ${esc(last['Name'])}</h2>`;
+  html += '<div class="cards">' + TRACK_METRICS.map(m => cardHtml(m, first, prev, last)).join('') + '</div>';
+  html += '<div class="chips">' + TRACK_METRICS.map(m =>
+    `<span class="chip${m === trackMetric ? ' on' : ''}" data-m="${m}">${m}</span>`).join('') + '</div>';
+  html += '<div class="chart-box"><canvas id="trendChart"></canvas></div>';
+  html += trendTableHtml(series);
+  detail.innerHTML = html;
+  detail.querySelectorAll('.chip').forEach(c =>
+    c.onclick = () => { trackMetric = c.dataset.m; renderTrackDetail(); });
+  drawTrend(series);
+}
+
+function drawTrend(series) {
+  const ctx = document.getElementById('trendChart');
+  if (!ctx) return;
+  const labels = series.map(p => p.t);
+  const data = series.map(p => num(p.row[trackMetric]));
+  if (trendChart) trendChart.destroy();
+  trendChart = new Chart(ctx, {
+    type: 'line',
+    data: { labels, datasets: [{
+      label: trackMetric, data, borderColor: '#2f5496',
+      backgroundColor: 'rgba(47,84,150,.12)', tension: .25, fill: true,
+      pointRadius: 4, pointBackgroundColor: '#2f5496', spanGaps: true,
+    }]},
+    options: { responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: { y: { beginAtZero: false } } },
+  });
+}
+
+// ---- xlsx 匯出（前端 SheetJS） ----
+function exportXlsx() {
+  if (!snapshot) { alert('尚未載入資料'); return; }
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb,
+    XLSX.utils.json_to_sheet(snapshot.column_definitions), '欄位說明');
+  [['value','價值投資精選'],['sheet1','廣泛價值清單'],['sheet2','嚴選防禦存股'],['all','全市場']].forEach(([k,name]) => {
+    const rows = snapshot.sheets[k] ? snapshot.sheets[k].rows : [];
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rows), name);
+  });
+  // 衍生雙池
+  const _vr = valueRows();
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(deriveCore(_vr)), '核心候選');
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(deriveSatellite(_vr)), '衛星候選');
+  const ts = snapshot.generated_at_display.replace(/[: ]/g,'-');
+  XLSX.writeFile(wb, `台股存股報告_${ts}.xlsx`);
+}
+
+// ---- 事件 ----
+document.getElementById('importBtn').onclick = () => document.getElementById('fileInput').click();
+document.getElementById('fileInput').onchange = e => {
+  const f = e.target.files[0]; if (!f) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    try {
+      const snap = JSON.parse(reader.result);
+      if (!snap.sheets) throw new Error('格式不符（缺 sheets）');
+      addSelectOption(snap.generated_at, '💾 ' + (snap.generated_at_display||'匯入') + '（瀏覽器）');
+      document.getElementById('snapSelect').value = snap.generated_at;
+      rememberSnapshot(snap);  // 只存匯入的；data/ 快照隨時可重抓
+      render(snap);
+    } catch (err) { alert('匯入失敗：' + err.message); }
+  };
+  reader.readAsText(f);
+};
+document.getElementById('snapSelect').onchange = e => {
+  const v = e.target.value;
+  if (v.startsWith('file:')) loadFromData(v.slice(5));
+  else if (v) { const s = storedSnapshots()[v]; if (s) render(s); }
+};
+document.getElementById('exportBtn').onclick = exportXlsx;
+document.getElementById('search').oninput = () => { if (snapshot && activeTab !== 'track') renderTable(); };
+document.getElementById('onlyWatch').onchange = () => { if (snapshot && activeTab !== 'track') renderTable(); };
+document.getElementById('trackAdd').onkeydown = e => {
+  if (e.key !== 'Enter') return;
+  const code = e.target.value.trim();
+  if (!code) return;
+  watch.add(code);
+  localStorage.setItem(WATCH_KEY, JSON.stringify([...watch]));
+  selectedTrackCode = code;
+  e.target.value = '';
+  renderWatchList(); renderTrackDetail();
+};
+
+init();
+</script>
+</body>
+</html>

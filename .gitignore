@@ -1,0 +1,6 @@
+__pycache__/
+.DS_Store
+.claude/settings.local.json
+# 可重建的快取
+data/daily_prices.json
+data/finmind_cache.json

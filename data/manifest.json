@@ -1,0 +1,86 @@
+{
+  "snapshots": [
+    {
+      "file": "snapshot_20261121_110436.json",
+      "generated_at": "2026-11-21T11:04:36",
+      "generated_at_display": "2026-11-21 11:04:36",
+      "counts": {
+        "value": 158,
+        "sheet1": 348,
+        "sheet2": 46,
+        "all": 1057
+      }
+    },
+    {
+      "file": "snapshot_20261121_105217.json",
+      "generated_at": "2026-11-21T10:52:17",
+      "generated_at_display": "2026-11-21 10:52:17",
+      "counts": {
+        "value": 158,
+        "sheet1": 348,
+        "sheet2": 46,
+        "all": 1057
+      }
+    },
+    {
+      "file": "snapshot_20260605_151720.json",
+      "generated_at": "2026-06-05T15:17:20",
+      "generated_at_display": "2026-06-05 15:17:20",
+      "counts": {
+        "value": 72,
+        "sheet1": 262,
+        "sheet2": 71
+      }
+    },
+    {
+      "file": "snapshot_20260605_114628.json",
+      "generated_at": "2026-06-05T11:46:28",
+      "generated_at_display": "2026-06-05 11:46:28",
+      "counts": {
+        "value": 82,
+        "sheet1": 274,
+        "sheet2": 19
+      }
+    },
+    {
+      "file": "snapshot_20260605_113350.json",
+      "generated_at": "2026-06-05T11:33:50",
+      "generated_at_display": "2026-06-05 11:33:50",
+      "counts": {
+        "value": 80,
+        "sheet1": 273,
+        "sheet2": 9
+      }
+    },
+    {
+      "file": "snapshot_20260604_141814.json",
+      "generated_at": "2026-06-04T14:18:14",
+      "generated_at_display": "2026-06-04 14:18:14",
+      "counts": {
+        "value": 81,
+        "sheet1": 271,
+        "sheet2": 0
+      }
+    },
+    {
+      "file": "snapshot_20260604_141248.json",
+      "generated_at": "2026-06-04T14:12:48",
+      "generated_at_display": "2026-06-04 14:12:48",
+      "counts": {
+        "value": 82,
+        "sheet1": 273,
+        "sheet2": 9
+      }
+    },
+    {
+      "file": "snapshot_20260603_195734.json",
+      "generated_at": "2026-06-03T19:57:34",
+      "generated_at_display": "2026-06-03 19:57:34",
+      "counts": {
+        "value": 89,
+        "sheet1": 272,
+        "sheet2": 0
+      }
+    }
+  ]
+}
