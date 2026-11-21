@@ -304,6 +304,7 @@ def build_yahoo_history(codes: list[str], cache_path=f"{DATA_DIR}/yahoo_hist.jso
 # TWSE 除權除息計算結果表（TWT49U）：全市場 20 年除息事件，一年一請求
 # ───────────────────────────────────────────
 TWT49U_CACHE = f"{DATA_DIR}/twt49u.json"
+TWT49U_DETAIL_CACHE = f"{DATA_DIR}/twt49u_detail.json"   # {"code,date": 現金股利}
 
 
 def parse_twt49u(j: dict) -> list[list]:
@@ -363,14 +364,61 @@ def load_twse_dividend_history(start_year: int = 2003, offline: bool = False) ->
     if fetched:
         print()
         save_json(TWT49U_CACHE, cache)
+    detail = load_json(TWT49U_DETAIL_CACHE, {})
     out: dict[str, list[dict]] = {}
+    busy, n_new = offline, 0
     for rows in cache.values():
         for code, d, amt, mixed in rows:
+            # 權息合計只對近 6 年（dps / 5 年均會用到）查明細拆出現金；更早的只影響年數，保留合計
+            if mixed and int(d[:4]) >= this_year - 5:
+                key = f"{code},{d}"
+                if key not in detail and not busy:
+                    # TWSE 約 40 次連發後回「忙碌」：每筆間隔 2s，忙碌時退避 20/40/60s，連 3 次失敗本輪停查
+                    for wait in (20, 40, 60, None):
+                        cash = fetch_twt49u_cash(code, d)
+                        if cash is not None or wait is None:
+                            break
+                        time.sleep(wait)
+                    if cash is None:
+                        busy = True
+                    else:
+                        detail[key] = cash
+                        n_new += 1
+                        if n_new % 25 == 0:
+                            save_json(TWT49U_DETAIL_CACHE, detail)
+                            print(f"\r    權息明細 {n_new} 筆", end="")
+                        time.sleep(2.0)
+                if isinstance(detail.get(key), (int, float)):   # 'missing' → 保留合計與標記
+                    amt, mixed = detail[key], False
+                    if amt <= 0:
+                        continue
             out.setdefault(code, []).append({"date": d, "amount": amt, "mixed": mixed})
+    if n_new:
+        save_json(TWT49U_DETAIL_CACHE, detail)
     for v in out.values():
         v.sort(key=lambda e: e["date"])
-    print(f"  💰 TWT49U 除息歷史 {len(cache)} 年（新抓 {fetched} 年），{len(out)} 檔")
+    left = sum(1 for v in out.values() for e in v if e["mixed"] and int(e["date"][:4]) >= this_year - 5)
+    print(f"  💰 TWT49U 除息歷史 {len(cache)} 年（新抓 {fetched} 年），{len(out)} 檔；"
+          f"權息明細新查 {n_new} 筆，未拆 {left} 筆")
     return out
+
+
+def fetch_twt49u_cash(code: str, day: str):
+    """TWT49UDetail → 每股現金股利（float）；'missing' = 查無明細；None = 忙碌/網路錯誤（可重試）。"""
+    try:
+        r = SESSION.get(f"{RWD_BASE}/exRight/TWT49UDetail", timeout=30,
+                        params={"STK_NO": code, "T1": day.replace("-", ""), "response": "json"})
+        j = r.json()
+    except Exception:
+        return None
+    stat = str(j.get("stat", ""))
+    if stat.lower() != "ok":
+        return "missing" if "無相關資料" in stat else None
+    f, rows = j.get("fields") or [], j.get("data") or []
+    i = next((k for k, x in enumerate(f) if "現金股利" in x), None)
+    if i is None or not rows:
+        return "missing"
+    return _num(str(rows[0][i]).split("元")[0]) or 0.0
 
 
 # ───────────────────────────────────────────

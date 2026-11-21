@@ -10,3 +10,4 @@ data/taiex.json
 data/us10y.json
 .pytest_cache/
 data/twt49u.json
+data/twt49u_detail.json
