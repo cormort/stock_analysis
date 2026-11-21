@@ -65,4 +65,5 @@ jobs:
           git add data/manifest.json data/snapshot_*.json
           git diff --cached --quiet && exit 0
           git commit -m "每日快照 $(TZ=Asia/Taipei date +%F)"
+          git pull --rebase -q   # 執行期間有人 push 時先接上，避免 rejected
           git push
