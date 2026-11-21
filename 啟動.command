@@ -11,15 +11,15 @@ echo "  📊 台股存股選股器"
 echo "================================"
 echo
 
-# 1) 是否先抓取最新資料（連線 TWSE，可能需數分鐘）
+# 1) 是否先抓取最新資料（TWSE 全市場 + 籌碼，首次約 3-5 分鐘）
 read -r -p "是否先抓取最新資料？[y/N] " ans
 if [[ "$ans" =~ ^[Yy]$ ]]; then
-  # 1b) 是否用 FinMind 多年配息/獲利資料（首次約 2~3 分鐘，之後走快取很快）
-  GI=""
-  read -r -p "  要 FinMind 多年配息/獲利資料嗎？(首次稍久，之後快取) [y/N] " gans
-  if [[ "$gans" =~ ^[Yy]$ ]]; then GI="FINMIND=1"; fi
+  # 1b) 是否抓 Yahoo 多年股利/年度 EPS（首次較久，之後走快取）
+  YA=""
+  read -r -p "  要抓 Yahoo 多年股利/年度 EPS 嗎？(首次數分鐘，之後快取) [Y/n] " yans
+  if [[ "$yans" =~ ^[Nn]$ ]]; then YA="--no-yahoo"; fi
   echo
-  env $GI python3 stock_screener.py
+  python3 stock_screener.py $YA
   if [[ $? -ne 0 ]]; then
     echo
     echo "❌ 抓取失敗，請檢查網路後再試。"

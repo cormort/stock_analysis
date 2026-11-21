@@ -4,3 +4,8 @@ __pycache__/
 # 可重建的快取
 data/daily_prices.json
 data/finmind_cache.json
+data/yahoo_hist.json
+data/chips.json
+data/taiex.json
+data/us10y.json
+.pytest_cache/

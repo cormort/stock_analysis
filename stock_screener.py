@@ -1,816 +1,506 @@
-"""
-台股終極存股選股器 v5.0 — 混合模式
-===================================
-架構：
-  Phase 1: TWSE OpenAPI 批量篩選全市場 (PE/PB/殖利率/股利/獲利率)
-  Phase 2: TWSE 日行情技術分析 (四大買賣點 + 均線；即時報價改由 server.py 按需取得)
+#!/usr/bin/env python3
+"""台股存股選股器 v6.0
+=====================
+v6 相對 v5 的修正（依據 2026-11 的 code review）：
+  1. 股利口徑單一化：近 12 個月實際除息 DPS（Yahoo 20+ 年歷史），5 年平均、穩定性倍數、
+     累積/連續配息年數都改用同一來源；TWSE 2 年資料僅作 fallback 並標記。
+  2. 0 / 缺值分離：抓不到就 null，不再用 0 冒充「沒有配息／沒有獲利」。
+  3. 綜合評分改 rank-based 多因子（估值/品質/籌碼/動能），取代 ≈PB 倒數的 CP 值。
+  4. 目標殖利率連動 10 年期美債（10Y + 3% 風險溢酬），不再寫死 6.25/5/4。
+  5. 新增品質（負債比/ROE/毛利率/營益率/業外依賴/PEG）、籌碼（外資持股/法人/融資）、
+     月營收、技術（量比/ATR/RS/二日法則）模組。
+  6. MI_INDEX 快取改存 OHLC + 成交金額（原本丟掉 high/low，等於浪費免費資料）。
 
-優化項目：
-  1. requests.Session 連線池 + 自動重試
-  2. 連續配息 / 連續獲利年數演算法
-  3. twstock 混合模式（自動導入 + 優雅降級）
-  4. Excel 欄位說明頁 + 表頭樣式 + 資料格式化
+用法：
+  python3 stock_screener.py                 # 完整執行（第一次約 3-5 分鐘）
+  python3 stock_screener.py --days 60       # 指定技術面回看交易日
+  python3 stock_screener.py --no-yahoo --no-chips   # 只跑 TWSE（快速檢查）
+  python3 stock_screener.py --offline       # 只用快取，不發網路請求
 """
+from __future__ import annotations
 
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-import pandas as pd
-import numpy as np
-import concurrent.futures
-import warnings
-import time
+import argparse
 import os
-import json
-from datetime import datetime, timedelta
-from functools import reduce
+import time
+from datetime import date, datetime
 
-warnings.filterwarnings('ignore', category=DeprecationWarning)
-warnings.filterwarnings('ignore', category=FutureWarning)
+import numpy as np
+import pandas as pd
 
-# ── twstock 導入（優雅降級：未安裝則跳過 Phase 2） ──
-try:
-    import twstock
-    TWSTOCK_AVAILABLE = True
-except ImportError:
-    twstock = None
-    TWSTOCK_AVAILABLE = False
-    print("⚠️  未偵測到 twstock，將跳過 Phase 2 個股分析。如需啟用請執行：pip install twstock")
+import stock_metrics as M
+import stock_sources as S
 
-# ── 多年歷史補強（FinMind；手動開關：FINMIND=1）──
-# TWSE 股利端點僅近 2 年且為季配部分加總；FinMind 提供多年完整股利與 EPS 歷史。
-# 啟用：FINMIND=1 python3 stock_screener.py（GOODINFO=1 亦相容）
-ENABLE_HISTORY = os.environ.get('FINMIND') == '1' or os.environ.get('GOODINFO') == '1'
-HISTORY_USED = False  # 實際是否成功補強（寫進快照供 UI 標示）
+SCREENER_VERSION = "6.0"
+DATA_DIR = "data"
+MANIFEST = "manifest.json"
 
-# ───────────────────────────────────────────
-# 常數設定 — 所有篩選閾值集中管理
-# ───────────────────────────────────────────
-SHEET1_CRITERIA = {
-    '溢價回收年限_上限': 15,
-    '殖利率_下限': 3.0,
-    '獲利率_下限': 3.0,
-    '盈餘發放率_下限': 30,
-    '盈餘發放率_上限': 110,
-}
-SHEET2_CRITERIA = {
-    '累積配息年數_下限': 2,   # ⚠️ TWSE API 僅提供近2年股利資料，待 Goodinfo 補強
-    '盈餘發放率_下限': 50,
-    '盈餘發放率_上限': 85,
-    '殖利率_下限': 4.0,
-    '溢價回收年限_上限': 15,
-}
-
-# 價值投資估價法參數（殖利率法）
-VALUE_YIELD = {
-    '便宜': 0.0625,   # 殖利率 6.25% → 便宜價
-    '合理': 0.05,     # 殖利率 5%    → 合理價
-    '昂貴': 0.04,     # 殖利率 4%    → 昂貴價
-}
-
-# 價值投資精選篩選條件
-VALUE_CRITERIA = {
-    'PE_上限': 15,                  # 本益比 ≤ 15
-    'PB_上限': 2.0,                 # 股價淨值比 ≤ 2.0
-    '安全邊際_下限': 0,              # 安全邊際 > 0%（現價低於合理價）
-    '連續獲利年數_下限': 0,          # 暫設0 — PE≤15已隱含獲利條件，待Goodinfo補強歷史EPS
-    '殖利率_下限': 4.0,             # 殖利率 ≥ 4%
-    '盈餘發放率_下限': 30,
-    '盈餘發放率_上限': 110,
-}
-
-# API 端點定義
-ENDPOINTS = {
-    'metrics':  "/exchangeReport/BWIBBU_ALL",       # PE, PB, Yield
-    'profit':   "/opendata/t187ap17_L",              # 獲利率
-    'prices':   "/exchangeReport/STOCK_DAY_AVG_ALL", # 價格
-    'div_hist': "/opendata/t187ap45_L",              # 歷史股利
-}
-
-API_BASE = "https://openapi.twse.com.tw/v1"
-SCREENER_VERSION = "5.0"
-DATA_DIR = "data"                       # 快照與 manifest 存放目錄
-MANIFEST_FILENAME = "manifest.json"     # Web UI 用來列出歷史快照
-HISTORY_CACHE = "data/finmind_cache.json"  # FinMind 結果磁碟快取（跨次累積，免重複查詢）
-HISTORY_TTL_DAYS = 30                     # 快取有效天數（股利/EPS 為年度資料，變動慢）
-
-# 三分頁的顯示標題與篩選條件（一併寫進快照，供 UI 顯示）
-SHEET_META = {
-    'value':  {'title': '💎 價值投資精選', 'criteria': VALUE_CRITERIA},
-    'sheet1': {'title': '📈 廣泛價值清單', 'criteria': SHEET1_CRITERIA},
-    'sheet2': {'title': '🛡️ 嚴選防禦存股', 'criteria': SHEET2_CRITERIA},
-    'all':    {'title': '🌐 全市場', 'criteria': {}},  # 未篩選，供個股追蹤與自訂排序
+INDUSTRY = {
+    "01": "水泥工業", "02": "食品工業", "03": "塑膠工業", "04": "紡織纖維",
+    "05": "電機機械", "06": "電器電纜", "08": "玻璃陶瓷", "09": "造紙工業",
+    "10": "鋼鐵工業", "11": "橡膠工業", "12": "汽車工業", "14": "建材營造",
+    "15": "航運業", "16": "觀光餐旅", "17": "金融保險", "18": "貿易百貨",
+    "20": "其他", "21": "化學工業", "22": "生技醫療", "23": "油電燃氣",
+    "24": "半導體業", "25": "電腦及週邊設備業", "26": "光電業",
+    "27": "通信網路業", "28": "電子零組件業", "29": "電子通路業",
+    "30": "資訊服務業", "31": "其他電子業", "32": "文化創意業",
+    "33": "農業科技業", "34": "電子商務", "35": "綠能環保",
+    "36": "數位雲端", "37": "運動休閒", "38": "居家生活",
+    "80": "管理股票", "91": "存託憑證",
 }
 
 
-# ───────────────────────────────────────────
-# 1. HTTP 層 — 連線池 + 自動重試
-# ───────────────────────────────────────────
-def _build_session() -> requests.Session:
-    """建立帶有連線池與重試邏輯的 Session（同 host 僅需一次 TCP 握手）"""
-    session = requests.Session()
-    retry = Retry(
-        total=3,
-        backoff_factor=0.5,          # 0.5s → 1s → 2s
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET"],
-    )
-    adapter = HTTPAdapter(
-        max_retries=retry,
-        pool_connections=1,          # 同一 host 只需 1 個連線池
-        pool_maxsize=4,              # 最多 4 條並行連線
-    )
-    session.mount("https://", adapter)
-    session.headers.update({
-        "Accept": "application/json",
-        "Accept-Encoding": "gzip, deflate",
-    })
-    return session
+def twse_dividend_events(div_df: pd.DataFrame) -> dict[str, list[dict]]:
+    """TWSE t187ap45_L → {code: [{date: 年度末, amount: 現金股利總和}]}。
 
-
-def fetch_endpoint(session: requests.Session, key: str, path: str):
-    """抓取單一 API 端點，回傳 (key, DataFrame | None)"""
-    url = f"{API_BASE}{path}"
-    try:
-        r = session.get(url, timeout=15)
-        r.raise_for_status()
-        data = r.json()
-        if not data:
-            print(f"  ⚠️  {key}: API 回傳空資料")
-            return key, None
-        return key, pd.DataFrame(data)
-    except requests.exceptions.RequestException as e:
-        print(f"  ❌ {key}: {e}")
-        return key, None
-
-
-# ───────────────────────────────────────────
-# 2. 資料清理
-# ───────────────────────────────────────────
-_CODE_ALIASES = {'Code', '公司代號', '證券代號'}
-
-def normalize_code_column(df: pd.DataFrame) -> pd.DataFrame:
-    """將各種代號欄位統一命名為『代號』並去空白"""
-    matched = _CODE_ALIASES & set(df.columns)
-    if matched:
-        df = df.rename(columns={col: '代號' for col in matched})
-    if '代號' in df.columns:
-        df['代號'] = df['代號'].astype(str).str.strip()
-    return df
-
-
-def safe_numeric(series: pd.Series, fill: float = 0) -> pd.Series:
-    """統一的安全數值轉換：dash → NaN → fill"""
-    return pd.to_numeric(
-        series.replace(['-', '--', ''], np.nan),
-        errors='coerce'
-    ).fillna(fill)
-
-
-# ───────────────────────────────────────────
-# 3. 股利邏輯 — 連續配發現金股利 + 連續獲利
-# ───────────────────────────────────────────
-def _calc_consecutive_years(df: pd.DataFrame, year_col: str, val_col: str, label: str = '') -> pd.DataFrame:
+    僅 2 個年度、且是「股利所屬年度」；只當 Yahoo 失敗時的 fallback，
+    並在資料狀態標記，不可與 20 年歷史混為一談。
     """
-    通用函數：計算每檔股票從最新年度往前，連續 val_col > 0 的年數。
-    回傳 DataFrame: [代號, placeholder]
-    """
-    streak_dict = {}
-    for code, group in df.groupby('代號'):
-        # 取出該股有正值的年度，由新到舊排列
-        positive_mask = group[val_col] > 0
-        positive_years = sorted(group.loc[positive_mask, year_col].unique(), reverse=True)
-
-        # 最新年度本身未配/虧損 → 連續中斷，為 0
-        if len(positive_years) == 0 or positive_years[0] != group[year_col].max():
-            streak_dict[code] = 0
-            continue
-
-        # 從最新年度往回數連續年
-        streak = 1
-        for i in range(1, len(positive_years)):
-            if positive_years[i - 1] - positive_years[i] == 1:
-                streak += 1
-            else:
-                break
-        streak_dict[code] = streak
-
-    result = pd.DataFrame(list(streak_dict.items()), columns=['代號', 'placeholder'])
-
-    # Debug: 顯示 top 5 驗證
-    if label:
-        top5 = result.nlargest(5, 'placeholder')
-        samples = ', '.join(f"{r['代號']}={r['placeholder']}年" for _, r in top5.iterrows())
-        print(f"    [{label}] Top5: {samples}")
-
-    return result
-
-
-def process_dividends(df_div_hist: pd.DataFrame):
-    """
-    回傳:
-      - df_streak: 代號 / 累積配息年數 / 連續配發現金股利年數 / 連續獲利年數
-      - df_latest_div: 代號 / 最新年度現金股利
-    """
-    # Debug: 顯示原始欄位名稱
-    print(f"    股利 API 原始欄位: {list(df_div_hist.columns)}")
-
-    # 動態偵測欄位名稱（容錯）
-    div_col = next((c for c in df_div_hist.columns if '現金股利' in c and '盈餘' in c), None)
-    if not div_col:
-        div_col = next((c for c in df_div_hist.columns if '現金股利' in c), None)
-    if not div_col:
-        print("  ❌ 找不到現金股利欄位！")
-        return pd.DataFrame(columns=['代號', '累積配息年數', '連續配發現金股利年數', '連續獲利年數']), \
-               pd.DataFrame(columns=['代號', '最新年度現金股利'])
-    print(f"    現金股利欄位: '{div_col}'")
-
-    year_col = next((c for c in df_div_hist.columns if '年度' in c), '股利年度')
-    print(f"    年度欄位: '{year_col}'")
-
-    df_div_hist[div_col] = safe_numeric(df_div_hist[div_col])
-    df_div_hist[year_col] = safe_numeric(df_div_hist[year_col]).astype(int)
-
-    # 動態偵測 EPS 欄位（常見名稱：每股盈餘(元)、每股盈餘）
-    eps_col = next((c for c in df_div_hist.columns if '每股盈餘' in c), None)
-    if eps_col:
-        df_div_hist[eps_col] = safe_numeric(df_div_hist[eps_col])
-        print(f"    EPS 欄位: '{eps_col}'")
-    else:
-        print("  ⚠️  歷史股利資料中未找到 EPS 欄位，連續獲利年數將設為 0")
-
-    # 季配息 → 年度加總
-    agg_dict = {div_col: 'sum'}
-    if eps_col:
-        agg_dict[eps_col] = 'first'  # EPS 同年度取第一筆（非加總）
-
-    df_yearly = (
-        df_div_hist
-        .groupby(['代號', year_col], as_index=False)
-        .agg(agg_dict)
-    )
-
-    # ── 累積配息年數 ──
-    df_total = (
-        df_yearly[df_yearly[div_col] > 0]
-        .groupby('代號')[year_col]
-        .nunique()
-        .reset_index(name='累積配息年數')
-    )
-
-    # Debug: 顯示年度範圍和資料筆數
-    yr_min, yr_max = df_yearly[year_col].min(), df_yearly[year_col].max()
-    n_stocks = df_yearly['代號'].nunique()
-    print(f"    股利資料: {n_stocks} 檔, 年度 {yr_min}~{yr_max} (共 {yr_max - yr_min + 1} 年)")
-
-    # 抽樣一檔確認: 取累積配息最多的一檔看看
-    sample_code = df_total.nlargest(1, '累積配息年數')['代號'].iloc[0] if not df_total.empty else None
-    if sample_code:
-        sample = df_yearly[df_yearly['代號'] == sample_code][[year_col, div_col]].sort_values(year_col, ascending=False).head(8)
-        print(f"    驗證 ({sample_code}) 最近股利:")
-        for _, row in sample.iterrows():
-            print(f"      年度 {int(row[year_col])}: 股利 {row[div_col]}")
-
-    # ── 連續配發現金股利年數（從最新年度往前算） ──
-    df_consec_div = _calc_consecutive_years(df_yearly, year_col, div_col, label='連續配息')
-    df_consec_div.columns = ['代號', '連續配發現金股利年數']
-
-    # ── 連續獲利年數（從最新年度往前算，EPS > 0） ──
-    if eps_col:
-        df_consec_eps = _calc_consecutive_years(df_yearly, year_col, eps_col, label='連續獲利')
-        df_consec_eps.columns = ['代號', '連續獲利年數']
-    else:
-        df_consec_eps = pd.DataFrame({'代號': df_yearly['代號'].unique(), '連續獲利年數': 0})
-
-    # 合併所有 streak 指標
-    df_streak = df_total
-    for df_s in [df_consec_div, df_consec_eps]:
-        df_streak = pd.merge(df_streak, df_s, on='代號', how='outer')
-    df_streak = df_streak.fillna(0)
-
-    # ── 最新年度現金股利 ──
-    df_latest = (
-        df_yearly
-        .sort_values(year_col, ascending=False)
-        .groupby('代號', as_index=False)
-        .first()
-        [['代號', div_col]]
-        .rename(columns={div_col: '最新年度現金股利'})
-    )
-
-    return df_streak, df_latest
-
-
-# ───────────────────────────────────────────
-# 4. 核心計算（全向量化）
-# ───────────────────────────────────────────
-def build_master_table(
-    df_metrics: pd.DataFrame,
-    df_profit: pd.DataFrame,
-    df_prices: pd.DataFrame,
-    df_streak: pd.DataFrame,
-    df_latest_div: pd.DataFrame,
-) -> pd.DataFrame:
-    """合併所有資料並計算衍生指標"""
-
-    # 轉換數值欄位
-    df_metrics['PE']   = safe_numeric(df_metrics['PEratio'])
-    df_metrics['PB']   = safe_numeric(df_metrics['PBratio'])
-    df_metrics['殖利率'] = safe_numeric(df_metrics['DividendYield'])
-    df_prices['收盤價']  = safe_numeric(df_prices['ClosingPrice'])
-
-    # 動態偵測純益率欄位
-    net_col = next((c for c in df_profit.columns if '純益率' in c), None)
-    assert net_col, "找不到純益率欄位，API 結構可能已變動"
-    df_profit['獲利率'] = safe_numeric(df_profit[net_col])
-
-    # 多表合併（用 reduce 取代串接 merge）
-    merge_specs = [
-        df_metrics[['代號', 'Name', 'PE', 'PB', '殖利率']],
-        df_prices[['代號', '收盤價']],
-        df_profit[['代號', '獲利率']],
-    ]
-    df_all = reduce(lambda l, r: pd.merge(l, r, on='代號', how='inner'), merge_specs)
-    df_all = pd.merge(df_all, df_streak, on='代號', how='left')
-    df_all = pd.merge(df_all, df_latest_div, on='代號', how='left')
-
-    # 填補 left join 產生的 NaN
-    fill_cols = {'累積配息年數': 0, '連續配發現金股利年數': 0, '連續獲利年數': 0, '最新年度現金股利': 0}
-    df_all = df_all.fillna(fill_cols)
-
-    return _derive_metrics(df_all)
-
-
-def _derive_metrics(df_all: pd.DataFrame) -> pd.DataFrame:
-    """由原始欄位（價格 / PE / PB / 股利 / 配息年數）計算所有衍生指標。
-    覆蓋股利資料（如 Goodinfo 補強）後可再呼叫一次以重算估價。"""
-    # 衍生指標（全部向量化）
-    pe_pos = df_all['PE'] > 0
-    pb_pos = df_all['PB'] > 0
-
-    df_all['EPS']     = np.where(pe_pos, (df_all['收盤價'] / df_all['PE']).round(2), 0)
-    df_all['每股淨值'] = np.where(pb_pos, (df_all['收盤價'] / df_all['PB']).round(2), 0)
-
-    eps_pos = df_all['EPS'] > 0
-    df_all['溢價回收年限'] = np.where(
-        eps_pos,
-        ((df_all['收盤價'] - df_all['每股淨值']) / df_all['EPS']).round(2),
-        99
-    )
-    df_all['盈餘發放率%'] = np.where(
-        eps_pos,
-        ((df_all['最新年度現金股利'] / df_all['EPS']) * 100).round(2),
-        0
-    )
-
-    # 投資 CP 值
-    adj_premium = np.maximum(df_all['溢價回收年限'], 0) + 1
-    df_all['投資CP值'] = (
-        (df_all['殖利率'] + df_all['累積配息年數'] / 2) / adj_premium
-    ).round(2)
-
-    # ── 價值投資估價（殖利率法） ──
-    div = df_all['最新年度現金股利']
-    div_pos = div > 0
-    df_all['便宜價'] = np.where(div_pos, (div / VALUE_YIELD['便宜']).round(2), 0)
-    df_all['合理價'] = np.where(div_pos, (div / VALUE_YIELD['合理']).round(2), 0)
-    df_all['昂貴價'] = np.where(div_pos, (div / VALUE_YIELD['昂貴']).round(2), 0)
-
-    # 安全邊際 = (合理價 - 現價) / 合理價 × 100%
-    fair = df_all['合理價']
-    df_all['安全邊際%'] = np.where(
-        fair > 0,
-        ((fair - df_all['收盤價']) / fair * 100).round(2),
-        -999
-    )
-
-    # 股價位階（無股利 → 無估價基準，標示為「—」而非誤判昂貴）
-    conditions = [
-        ~div_pos,
-        df_all['收盤價'] <= df_all['便宜價'],
-        df_all['收盤價'] <= df_all['合理價'],
-        df_all['收盤價'] <= df_all['昂貴價'],
-        df_all['收盤價'] > df_all['昂貴價'],
-    ]
-    choices = ['—', '💚 便宜', '💛 合理', '🟠 偏貴', '🔴 昂貴']
-    df_all['股價位階'] = np.select(conditions, choices, default='—')
-
-    return df_all
-
-
-def enrich_with_finmind(df_all: pd.DataFrame) -> pd.DataFrame:
-    """用 FinMind 多年歷史覆蓋候選股的 累積/連續配息年數、最新年度現金股利、連續獲利年數，再重算估價。
-
-    候選以 TWSE 穩定指標（殖利率/PE/PB）粗篩以限制查詢量；非候選沿用 TWSE 資料。
-    結果存磁碟快取，重跑只補未快取者。
-    """
-    global HISTORY_USED
-    try:
-        import finmind_source
-    except ImportError as e:
-        print(f"  ⚠️  無法載入 finmind_source（{e}），跳過歷史補強")
-        return df_all
-
-    cand = df_all[(df_all['殖利率'] >= 4) & (df_all['PE'] > 0) &
-                  (df_all['PE'] <= 18) & (df_all['PB'] <= 2.5)]['代號'].tolist()
-    if not cand:
-        print("  ⚠️  無符合粗篩的候選股，跳過歷史補強")
-        return df_all
-
-    os.makedirs(DATA_DIR, exist_ok=True)
-    try:
-        with open(HISTORY_CACHE, encoding='utf-8') as f:
-            cache = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        cache = {}
-    now = time.time()
-    # v2：最新股利改為近一年（季配加總最近4次）；舊版快取視為過期
-    is_fresh = lambda v: v.get('v') == 2 and (now - v.get('ts', 0)) < HISTORY_TTL_DAYS * 86400
-
-    to_fetch = [c for c in cand if not (c in cache and is_fresh(cache[c]))]
-    print(f"  📦 候選 {len(cand)} 檔；已快取 {len(cand) - len(to_fetch)} 檔，待查 {len(to_fetch)} 檔")
-
-    if to_fetch:
-        fdf = finmind_source.batch_fetch(to_fetch)
-        if 'fin_最新股利' in fdf.columns:
-            for _, row in fdf.dropna(subset=['fin_最新股利']).iterrows():
-                cache[str(row['代號'])] = {
-                    '累積': int(row['fin_累積配息年數']),
-                    '連續': int(row['fin_連續配息年數']),
-                    '最新': float(row['fin_最新股利']),
-                    '獲利': int(row['fin_連續獲利年數']),
-                    'ts': now,
-                    'v': 2,
-                }
-        with open(HISTORY_CACHE, 'w', encoding='utf-8') as f:
-            json.dump(cache, f, ensure_ascii=False, indent=2)
-
-    applied = {c: cache[c] for c in cand if c in cache and is_fresh(cache[c])}
-    if not applied:
-        print("  ⚠️  尚無可用的 FinMind 快取，沿用 TWSE 股利")
-        return df_all
-
-    m = df_all['代號'].isin(applied)
-    df_all.loc[m, '累積配息年數'] = df_all.loc[m, '代號'].map(lambda c: applied[c]['累積'])
-    df_all.loc[m, '連續配發現金股利年數'] = df_all.loc[m, '代號'].map(lambda c: applied[c]['連續'])
-    df_all.loc[m, '最新年度現金股利'] = df_all.loc[m, '代號'].map(lambda c: applied[c]['最新'])
-    df_all.loc[m, '連續獲利年數'] = df_all.loc[m, '代號'].map(lambda c: applied[c].get('獲利', 0))
-
-    HISTORY_USED = True
-    print(f"  ✅ 套用 FinMind {int(m.sum())} 檔（快取共 {len(cache)} 檔），重算估價中...")
-    return _derive_metrics(df_all)
-
-
-# ───────────────────────────────────────────
-# 5. 篩選
-# ───────────────────────────────────────────
-def apply_filters(df_all: pd.DataFrame):
-    """三軌篩選，回傳 (value_df, sheet1_df, sheet2_df)"""
-
-    # ── 價值投資精選（以安全邊際排序） ──
-    cv = VALUE_CRITERIA
-    value_sheet = df_all[
-        (df_all['PE'] > 0) &
-        (df_all['PE']              <= cv['PE_上限']) &
-        (df_all['PB']              <= cv['PB_上限']) &
-        (df_all['安全邊際%']       >= cv['安全邊際_下限']) &
-        (df_all['連續獲利年數']    >= cv['連續獲利年數_下限']) &
-        (df_all['殖利率']          >= cv['殖利率_下限']) &
-        (df_all['盈餘發放率%']     >= cv['盈餘發放率_下限']) &
-        (df_all['盈餘發放率%']     <= cv['盈餘發放率_上限'])
-    ].sort_values('安全邊際%', ascending=False).copy()
-
-    # ── 廣泛價值清單 ──
-    c1 = SHEET1_CRITERIA
-    sheet1 = df_all[
-        (df_all['溢價回收年限'] <= c1['溢價回收年限_上限']) &
-        (df_all['殖利率']       >= c1['殖利率_下限']) &
-        (df_all['獲利率']       >= c1['獲利率_下限']) &
-        (df_all['盈餘發放率%']  >= c1['盈餘發放率_下限']) &
-        (df_all['盈餘發放率%']  <= c1['盈餘發放率_上限'])
-    ].sort_values('投資CP值', ascending=False).copy()
-
-    # ── 嚴選防禦存股 ──
-    c2 = SHEET2_CRITERIA
-    sheet2 = df_all[
-        (df_all['累積配息年數']  >= c2['累積配息年數_下限']) &
-        (df_all['盈餘發放率%']  >= c2['盈餘發放率_下限']) &
-        (df_all['盈餘發放率%']  <= c2['盈餘發放率_上限']) &
-        (df_all['殖利率']       >= c2['殖利率_下限']) &
-        (df_all['溢價回收年限'] <= c2['溢價回收年限_上限'])
-    ].sort_values('投資CP值', ascending=False).copy()
-
-    return value_sheet, sheet1, sheet2
-
-
-# ───────────────────────────────────────────
-# 5b. twstock 個股補充分析
-# ───────────────────────────────────────────
-DAILY_CACHE = "data/daily_prices.json"   # MI_INDEX 每日全市場行情快取（過去日期不會變）
-MA_DAYS = 60                             # 需要的交易日數（60日均價）
-MI_INDEX_URL = "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX"
-
-
-def load_daily_history(n_days: int = MA_DAYS) -> dict:
-    """抓最近 n_days 個交易日的全市場日行情（TWSE MI_INDEX，一天一個請求含全部個股）。
-
-    回傳 {代號: [(成交股數, 開盤, 收盤), ...]}（舊→新）。過去日期存磁碟快取，
-    之後每次只需補當天；休市日也記錄（空 dict）避免重查。
-    """
-    try:
-        with open(DAILY_CACHE, encoding='utf-8') as f:
-            cache = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        cache = {}
-
-    today = datetime.now().date()
-    days, fetched, d = [], 0, today
-    while len(days) < n_days and (today - d).days < n_days * 2:
-        key = d.strftime('%Y%m%d')
-        if d.weekday() < 5:
-            day = {}
-            if key not in cache:
-                day = _fetch_mi_index(key)
-                fetched += 1
-                print(f"\r    下載日行情 {key}（第 {fetched} 天）", end='')
-                if day or (day is not None and d < today):  # 網路失敗(None)或今天尚未收盤 → 不快取，下次再試
-                    cache[key] = day
-                time.sleep(1.5)                # TWSE 限流：過快會被暫時封鎖 IP
-            if cache.get(key):
-                days.append(key)
-            elif day is None:              # 網路失敗：中斷，避免整段空查
-                break
-        d -= timedelta(days=1)
-    if fetched:
-        print()
-        keep = {k: v for k, v in cache.items() if k >= d.strftime('%Y%m%d')}  # 只留窗口內，檔案不無限長大
-        with open(DAILY_CACHE, 'w', encoding='utf-8') as f:
-            json.dump(keep, f, separators=(',', ':'))
-
-    hist = {}
-    for key in sorted(days):
-        for code, row in cache[key].items():
-            hist.setdefault(code, []).append(row)
-    print(f"  📅 日行情 {len(days)} 個交易日（新下載 {fetched} 天），{len(hist)} 檔")
-    return hist
-
-
-def _fetch_mi_index(date_key: str) -> dict:
-    """單日全市場收盤行情 → {代號: [成交股數, 開盤, 收盤]}；休市/無資料回傳 {}，網路失敗回傳 None"""
-    try:
-        r = requests.get(MI_INDEX_URL, params={'date': date_key, 'type': 'ALLBUT0999', 'response': 'json'},
-                         timeout=20)
-        j = r.json()
-    except Exception as e:
-        print(f"\n  ⚠️  {date_key} 日行情抓取失敗: {e}")
-        return None
-    table = next((t for t in j.get('tables', []) if '每日收盤行情' in t.get('title', '')), None)
-    if j.get('stat') != 'OK' or not table:
+    cols = []
+    for key in ("盈餘分配之現金股利", "法定盈餘公積發放之現金", "資本公積發放之現金"):
+        c = next((x for x in div_df.columns if key in x and "配股" not in x), None)
+        if c:
+            cols.append(c)
+    if not cols:
         return {}
-    f = table['fields']
-    ic, iv, io, ix = f.index('證券代號'), f.index('成交股數'), f.index('開盤價'), f.index('收盤價')
-    num = lambda v: float(str(v).replace(',', ''))
+    ycol = next((c for c in div_df.columns if "股利年度" in c), None)
+    if not ycol:
+        return {}
+    d = div_df.copy()
+    d["_year"] = pd.to_numeric(d[ycol], errors="coerce")
+    for c in cols:
+        d[c] = pd.to_numeric(d[c].replace("", np.nan), errors="coerce").fillna(0)
+    d["_cash"] = d[cols].sum(axis=1)
+    d = d.dropna(subset=["_year"])
+    d = d[d["_year"] <= date.today().year - 1911]
     out = {}
-    for row in table['data']:
-        try:
-            out[row[ic].strip()] = [num(row[iv]), num(row[io]), num(row[ix])]
-        except ValueError:                     # '--' = 當日無成交，略過該日
-            pass
+    for (code, roc_year), g in d.groupby(["代號", "_year"]):
+        amount = round(float(g["_cash"].sum()), 4)
+        if amount > 0:
+            out.setdefault(str(code), []).append(
+                {"date": f"{int(roc_year) + 1911}-12-31", "amount": amount})
     return out
 
 
-def _analyze_history(rows: list) -> dict:
-    """由日行情計算均線 + twstock 四大買賣點（沿用 twstock 判斷邏輯，只換資料來源）"""
-    result = {'四大買賣點': '—', '技術面理由': '—', '5日均價': 0, '20日均價': 0, '60日均價': 0}
-    if len(rows) < 6:                          # 四大買賣點需 6 日均線
-        result['四大買賣點'] = '資料不足'
-        return result
-    price = [r[2] for r in rows]
-    for n in (5, 20, 60):
-        if len(price) >= n:
-            result[f'{n}日均價'] = round(sum(price[-n:]) / n, 2)
+# ───────────────────────────────────────────
+# 主表
+# ───────────────────────────────────────────
+def build_master(frames, status, us10y, market_hist, taiex, chips,
+                 yahoo, source_status, premium=None) -> pd.DataFrame:
+    met = frames["metrics"].copy()
+    met["PE"] = pd.to_numeric(met["PEratio"].replace("-", np.nan), errors="coerce")
+    met["PB"] = pd.to_numeric(met["PBratio"].replace("-", np.nan), errors="coerce")
+    met["殖利率_官方"] = pd.to_numeric(met["DividendYield"].replace("-", np.nan), errors="coerce")
+    met["資料日期"] = met["Date"].astype(str)
 
-    class _Hist(twstock.analytics.Analytics):  # BestFourPoint 只用 price / open / capacity
-        pass
-    h = _Hist()
-    h.price, h.open, h.capacity = price, [r[1] for r in rows], [r[0] for r in rows]
-    try:
-        signal = twstock.BestFourPoint(h).best_four_point()
-    except Exception:
-        signal = None
-    if signal:
-        is_buy, reason = signal
-        result['四大買賣點'] = '🟢 買進' if is_buy else '🔴 賣出'
-        result['技術面理由'] = reason
+    pri = frames["prices"][["代號", "ClosingPrice"]].copy()
+    pri["收盤價"] = pd.to_numeric(pri["ClosingPrice"].replace("-", np.nan), errors="coerce")
+    pri = pri.drop_duplicates("代號")[["代號", "收盤價"]]
+
+    pro = frames["profit"].copy()
+    net_col = next((c for c in pro.columns if "純益率" in c), None)
+    pro["獲利率"] = (pd.to_numeric(pro[net_col], errors="coerce")
+                  if net_col else np.nan)
+    pro = pro.drop_duplicates("代號")[["代號", "獲利率"]]
+
+    basic = frames["basic"][["代號", "產業別"]].copy()
+    basic["產業"] = (basic["產業別"].astype(str).str.strip().str.zfill(2)
+                  .map(INDUSTRY).fillna("其他"))
+    basic = basic.drop_duplicates("代號")[["代號", "產業"]]
+
+    bal = frames["balance"].copy()
+    for c in ("資產總計", "負債總計", "權益總計", "股本", "每股參考淨值"):
+        bal[c] = pd.to_numeric(bal[c].replace("", np.nan), errors="coerce")
+    bal["負債比%"] = np.where(bal["資產總計"] > 0,
+                            (bal["負債總計"] / bal["資產總計"] * 100).round(2), np.nan)
+    bal = bal.drop_duplicates("代號")[["代號", "負債比%", "權益總計", "每股參考淨值"]]
+
+    inc = frames["income"].copy()
+    for c in ("營業收入", "營業毛利（毛損）淨額", "營業利益（損失）",
+              "基本每股盈餘（元）", "季別"):
+        inc[c] = pd.to_numeric(inc[c].replace("", np.nan), errors="coerce")
+    inc = inc.drop_duplicates("代號")
+    q = inc.apply(lambda r: M.quality_metrics(r), axis=1, result_type="expand")
+    inc = pd.concat([inc[["代號"]].reset_index(drop=True), q.reset_index(drop=True)], axis=1)
+
+    rev = frames["revenue"].copy()
+    rev["月營收YoY%"] = pd.to_numeric(rev["營業收入-去年同月增減(%)"], errors="coerce").round(2)
+    rev["月營收MoM%"] = pd.to_numeric(rev["營業收入-上月比較增減(%)"], errors="coerce").round(2)
+    rev = rev.rename(columns={"資料年月": "營收年月"})
+    rev = rev.drop_duplicates("代號")[["代號", "營收年月", "月營收YoY%", "月營收MoM%"]]
+
+    # 公積配息佔比（同一股利年度可能多列 → 先彙總再取最新年度）
+    ds = frames["dividend"].copy()
+    cols = {}
+    for key, label in [("盈餘分配之現金股利", "配息_盈餘"),
+                       ("法定盈餘公積發放之現金", "配息_法積"),
+                       ("資本公積發放之現金", "配息_公積")]:
+        c = next((x for x in ds.columns if key in x and "配股" not in x), None)
+        if c:
+            cols[label] = c
+    if cols:
+        for label, c in cols.items():
+            ds[label] = pd.to_numeric(ds[c].replace("", np.nan), errors="coerce")
+        ycol = next((c for c in ds.columns if "股利年度" in c), None)
+        ds["股利年度"] = pd.to_numeric(ds[ycol], errors="coerce")
+        grp = ds.groupby(["代號", "股利年度"], as_index=False).agg(
+            {**{k: "sum" for k in cols}, "期別": "count"})
+        grp = grp.sort_values("股利年度").groupby("代號", as_index=False).last()
+        grp["股利合計_官方"] = grp[list(cols)].sum(axis=1)
+        grp["公積配息佔比%"] = np.where(
+            grp["股利合計_官方"] > 0,
+            ((grp.get("配息_法積", 0) + grp.get("配息_公積", 0))
+             / grp["股利合計_官方"] * 100).round(2), np.nan)
+        ds = grp[["代號", "公積配息佔比%", "股利合計_官方"]]
     else:
-        result['四大買賣點'] = '⚪ 觀望'
-        result['技術面理由'] = '無明確訊號'
-    return result
+        ds = pd.DataFrame(columns=["代號", "公積配息佔比%", "股利合計_官方"])
 
+    df = met[["代號", "Name", "PE", "PB", "殖利率_官方", "資料日期"]].copy()
+    for extra in (pri, pro, basic, bal, inc, rev, ds):
+        if extra is not None and len(extra):
+            df = df.merge(extra, on="代號", how="left")
+    df = df[df["收盤價"].notna()].reset_index(drop=True)
 
-def enrich_with_twstock(df: pd.DataFrame, analysis_map: dict) -> pd.DataFrame:
-    """補上四大買賣點 + 均線分析（純對應，不發網路請求）。
-    盤中即時報價不進快照，改由 server.py 的 /api/quote 在檢視時按需取得。"""
-    if not TWSTOCK_AVAILABLE or df.empty:
-        return df
+    penalty = set(frames["penalty"]["代號"].astype(str)) if frames.get("penalty") is not None else set()
+    tx_closes = list(taiex.values()) if taiex else None
+    twse_events = twse_dividend_events(frames["dividend"])
 
-    # 合併回 DataFrame
-    df['四大買賣點']  = df['代號'].map(lambda c: analysis_map.get(c, {}).get('四大買賣點', '—'))
-    df['技術面理由']  = df['代號'].map(lambda c: analysis_map.get(c, {}).get('技術面理由', '—'))
-    df['5日均價']    = df['代號'].map(lambda c: analysis_map.get(c, {}).get('5日均價', 0))
-    df['20日均價']   = df['代號'].map(lambda c: analysis_map.get(c, {}).get('20日均價', 0))
-    df['60日均價']   = df['代號'].map(lambda c: analysis_map.get(c, {}).get('60日均價', 0))
+    # ── 逐檔：股利 / EPS / 技術 / 籌碼 ──
+    recs = []
+    for _, r in df.iterrows():
+        code = str(r["代號"])
+        y = yahoo.get(code) or {}
+        divs = y.get("divs") or []
+        dstatus = y.get("div_status", "error")
+        if not divs and twse_events.get(code):
+            divs, dstatus = twse_events[code], "twse_fallback"
+        dstats = M.dividend_stats(divs, date.today())
+        estats = M.eps_stats(y.get("eps") or {})
+        tech = M.technical_stats(market_hist.get(code, []), tx_closes)
+        chip = S.chip_summary(chips, code) if chips else {}
+        recs.append({**dstats, **estats, **tech, **chip,
+                     "股利資料狀態": dstatus,
+                     "獲利資料狀態": y.get("eps_status", "error"),
+                     "歷史交易日數": len(market_hist.get(code, []))})
+
+    df = pd.concat([df, pd.DataFrame(recs)], axis=1)
+    df = df.rename(columns={
+        "cum_years": "累積配息年數", "consec_years": "連續配發現金股利年數",
+        "stability": "股利穩定性倍數", "data_years": "股利資料年數",
+        "span": "股利歷史跨度", "eps": "年度EPS", "years": "獲利資料年數",
+        "streak": "連續獲利年數", "g1": "EPS成長_最新%", "g3": "EPS成長_3年CAGR%",
+    })
+    # DataFrame 由 dict 組成，缺值會是 object → 統一轉數值（失敗即 NaN）
+    text_cols = {"代號", "Name", "產業", "風險標記", "資料狀態", "股價位階",
+                 "二日法則_20MA", "二日法則_60MA", "技術資料狀態", "籌碼資料狀態",
+                 "股利資料狀態", "獲利資料狀態", "資料日期", "營收年月"}
+    for c in df.columns:
+        if c not in text_cols:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    # ── 基本衍生 ──
+    price = df["收盤價"]
+    df["EPS"] = np.where(df["PE"] > 0, (price / df["PE"]).round(2), np.nan)
+    df["每股淨值"] = np.where(df["每股參考淨值"] > 0, df["每股參考淨值"],
+                           np.where(df["PB"] > 0, price / df["PB"], np.nan))
+    df["每股淨值"] = pd.to_numeric(df["每股淨值"], errors="coerce").round(2)
+    df["ROE%"] = np.where((df["EPS"] > 0) & (df["每股淨值"] > 0),
+                        (df["EPS"] / df["每股淨值"] * 100).round(2), np.nan)
+    df["業外依賴度"] = (df["獲利率"] - df["營益率%"]).round(2)
+
+    eps_base = df["年度EPS"].where(df["年度EPS"] > 0, df["EPS"])
+    df["盈餘發放率%"] = np.where((df["dps"] > 0) & (eps_base > 0),
+                            (df["dps"] / eps_base * 100).round(2), np.nan)
+    df["PE_年報"] = np.where(df["年度EPS"] > 0, (price / df["年度EPS"]).round(2), np.nan)
+    df["溢價回收年限"] = np.where((df["EPS"] > 0) & (price > 0),
+                            ((price - df["每股淨值"]) / df["EPS"]).round(2), np.nan)
+
+    for tag in ("A", "B"):
+        g = df[f"EPS成長_{'最新%' if tag == 'A' else '3年CAGR%'}"]
+        pe = df["PE_年報"]
+        ok = g.between(5, 150) & (pe > 0)
+        df[f"PEG_{tag}"] = np.where(ok, (pe / g).round(2), np.nan)
+
+    val = df.apply(lambda r: M.valuation_metrics(
+        r["dps"], r["five_avg"], r["收盤價"], us10y, premium), axis=1, result_type="expand")
+    df = pd.concat([df, val], axis=1)
+
+    df["殖利率"] = np.where(df["dps"] > 0,
+                          (df["dps"] / price * 100).round(2), np.nan)
+    df["殖利率差異(pp)"] = (df["殖利率"] - df["殖利率_官方"]).round(2)
+
+    df = M.composite_score(df)
+    df["風險標記"] = df.apply(lambda r: M.risk_flags(r, penalty), axis=1)
+    df = M.apply_risk_penalty(df)
+    df["排除"] = df["風險標記"].str.contains("KY股|違規裁處|流動性不足", na=False)
+    df["資料狀態"] = df.apply(lambda r: M.data_status(r, source_status), axis=1)
     return df
 
 
 # ───────────────────────────────────────────
-# 6. 欄位說明資料
+# 篩選
 # ───────────────────────────────────────────
-COLUMN_DEFINITIONS = [
-    {'欄位名稱': '代號', '定義': '台灣證券交易所的股票代碼', '數值越大代表': '—', '數值越小代表': '—', '存股參考': '純識別用途，無方向性意義'},
-    {'欄位名稱': 'Name', '定義': '公司名稱', '數值越大代表': '—', '數值越小代表': '—', '存股參考': '純識別用途'},
-    {'欄位名稱': 'PE (本益比)', '定義': '股價 ÷ 每股盈餘 (EPS)。代表投資人願意為每 1 元獲利付出多少錢', '數值越大代表': '市場給予較高評價，或股價偏貴（成長股常見 PE 20~40+）', '數值越小代表': '可能被低估，或市場對前景保守（價值股常見 PE 8~15）', '存股參考': '⭐ 存股偏好低 PE（<15），代表用較少的錢買到較多的獲利能力'},
-    {'欄位名稱': 'PB (股價淨值比)', '定義': '股價 ÷ 每股淨值。衡量股價相對於公司帳面資產的溢價程度', '數值越大代表': '股價遠超過帳面價值，溢價高（品牌/技術溢價或泡沫）', '數值越小代表': '股價接近甚至低於帳面價值，可能是撿便宜機會', '存股參考': '⭐ PB < 1.5 較安全；PB < 1 代表「打折買資產」，但需排除衰退股'},
-    {'欄位名稱': '殖利率 (%)', '定義': '每股現金股利 ÷ 股價 × 100%。衡量持有一年的現金回報率', '數值越大代表': '💰 每投入 1 元能拿回更多股利，現金流回報高', '數值越小代表': '股利回報低，可能是成長股（不配息）或股價過高', '存股參考': '⭐⭐ 存股核心指標！一般 ≥ 4% 為佳，≥ 5% 為優，≥ 7% 需留意是否為一次性'},
-    {'欄位名稱': '收盤價', '定義': '該股票最近一個交易日的收盤價格（元）', '數值越大代表': '每股價格高（不代表貴，需搭配 PE/PB 判斷）', '數值越小代表': '每股價格低（不代表便宜，低價股可能是體質差）', '存股參考': '單看股價無意義，需搭配其他估值指標綜合判斷'},
-    {'欄位名稱': '獲利率 (純益率 %)', '定義': '稅後淨利 ÷ 營收 × 100%。公司每賺 100 元營收，實際淨賺多少', '數值越大代表': '💪 公司賺錢效率高，護城河深，產品附加價值高', '數值越小代表': '利潤微薄，競爭激烈或成本控制差', '存股參考': '⭐ 獲利率 ≥ 10% 為優秀，≥ 5% 為合格，< 3% 需警戒'},
-    {'欄位名稱': '累積配息年數', '定義': '歷史資料中，該公司總共有幾個年度發放過現金股利', '數值越大代表': '📈 配息經驗豐富，公司有長期回饋股東的習慣', '數值越小代表': '配息歷史短，可能是新上市或過去較少配息', '存股參考': '⭐ ≥ 10 年代表穩定配息體質，是防禦型存股的基本門檻'},
-    {'欄位名稱': '連續配發現金股利年數', '定義': '從最近一年往前推算，連續不中斷發放現金股利的年數', '數值越大代表': '🏆 穩定性極高，即使景氣波動也持續配發現金', '數值越小代表': '近年曾中斷配息，現金流穩定性存疑', '存股參考': '⭐⭐ 連續 ≥ 10 年是「定存股」黃金標準，比累積更嚴格'},
-    {'欄位名稱': '連續獲利年數', '定義': '從最近一年往前推算，連續每股盈餘 (EPS) > 0 的年數', '數值越大代表': '💪 公司獲利穩定，即使遇到景氣低谷也不虧損', '數值越小代表': '近年曾出現虧損，獲利體質不夠穩健', '存股參考': '⭐⭐ 連續獲利是配息的根基！無獲利則配息不可持續，≥ 10 年為優'},
-    {'欄位名稱': '最新年度現金股利', '定義': '最近一個完整年度發放的現金股利合計（含季配加總）', '數值越大代表': '每股發放的現金多', '數值越小代表': '每股發放的現金少', '存股參考': '需搭配 EPS 看發放率，單獨看意義有限'},
-    {'欄位名稱': 'EPS (每股盈餘)', '定義': '收盤價 ÷ PE。代表每一股在過去一年賺了多少錢', '數值越大代表': '💰 公司賺錢能力強，每股含金量高', '數值越小代表': '獲利能力弱或虧損', '存股參考': '⭐ EPS 穩定成長的公司最適合存股，代表獲利引擎健康'},
-    {'欄位名稱': '每股淨值', '定義': '收盤價 ÷ PB。公司每一股對應的帳面資產價值', '數值越大代表': '每股背後的資產厚實', '數值越小代表': '資產單薄，抗風險能力可能較差', '存股參考': '淨值是股價的「地板價」參考，股價跌破淨值可能是機會或警訊'},
-    {'欄位名稱': '溢價回收年限', '定義': '(股價 - 每股淨值) ÷ EPS。買入時多付的溢價，需要幾年的獲利才能賺回來', '數值越大代表': '⚠️ 溢價太高，回本時間長，風險較高', '數值越小代表': '✅ 溢價低甚至折價，回本快，安全邊際大', '存股參考': '⭐⭐ 核心安全指標！≤ 5 年極佳，≤ 10 年良好，> 15 年偏貴'},
-    {'欄位名稱': '盈餘發放率 (%)', '定義': '現金股利 ÷ EPS × 100%。公司把賺到的錢拿出多少比例分給股東', '數值越大代表': '股東分到的比例高（但 >100% 代表借錢配息，危險⚠️）', '數值越小代表': '公司保留較多盈餘再投資（成長股常見）', '存股參考': '⭐ 存股理想區間 50%~85%，兼顧配息與公司成長動能'},
-    {'欄位名稱': '投資CP值', '定義': '(殖利率 + 累積配息年數/2) ÷ (溢價回收年限+1)。綜合評分指標', '數值越大代表': '🌟 殖利率高 + 配息穩 + 溢價低 → 高性價比', '數值越小代表': '性價比低，可能殖利率差或溢價過高', '存股參考': '⭐⭐⭐ 本報告的核心排序指標，越高越值得優先研究'},
-    {'欄位名稱': '四大買賣點', '定義': 'twstock 內建技術分析：量價關係 + 3日/6日均線交叉判斷買賣訊號', '數值越大代表': '—', '數值越小代表': '—', '存股參考': '⭐ 🟢買進 = 可考慮分批進場；🔴賣出 = 暫緩買入；⚪觀望 = 等待訊號'},
-    {'欄位名稱': '技術面理由', '定義': '四大買賣點的具體觸發理由', '數值越大代表': '—', '數值越小代表': '—', '存股參考': '搭配四大買賣點一起看'},
-    {'欄位名稱': '5日/20日/60日均價', '定義': '最近 N 日收盤價的簡單移動平均 (SMA)', '數值越大代表': '近期均價較高，可能處於上升趨勢', '數值越小代表': '近期均價較低', '存股參考': '⭐ 現價 < 20日均價 可能是進場機會；現價 > 60日均價很多則偏貴'},
-    {'欄位名稱': '便宜價', '定義': '最新年度現金股利 ÷ 6.25%。殖利率達 6.25% 時的股價', '數值越大代表': '該股股利高，對應的「便宜」門檻也高', '數值越小代表': '股利低', '存股參考': '⭐⭐ 現價 ≤ 便宜價 → 極度低估，是分批進場的好時機'},
-    {'欄位名稱': '合理價', '定義': '最新年度現金股利 ÷ 5%。殖利率達 5% 時的股價', '數值越大代表': '合理估值較高', '數值越小代表': '合理估值較低', '存股參考': '⭐⭐ 現價 ≤ 合理價 → 估值合理，可考慮買入'},
-    {'欄位名稱': '昂貴價', '定義': '最新年度現金股利 ÷ 4%。殖利率只有 4% 時的股價', '數值越大代表': '昂貴門檻高', '數值越小代表': '昂貴門檻低', '存股參考': '現價 > 昂貴價 → 股價偏貴，存股族應暫緩買入'},
-    {'欄位名稱': '安全邊際%', '定義': '(合理價 − 現價) ÷ 合理價 × 100%。正值代表現價低於合理價', '數值越大代表': '🟢 折價幅度大，安全邊際高，買入風險低', '數值越小代表': '🔴 現價超過合理價，溢價越多風險越高', '存股參考': '⭐⭐⭐ 價值投資核心指標！> 20% 為優質安全邊際'},
-    {'欄位名稱': '股價位階', '定義': '將現價對應到便宜/合理/昂貴三個價位的分類', '數值越大代表': '—', '數值越小代表': '—', '存股參考': '⭐ 💚便宜 = 積極買入；💛合理 = 可買；🟠偏貴 = 觀望；🔴昂貴 = 不買'},
+def cap_industry(df: pd.DataFrame, n: int = 5) -> pd.DataFrame:
+    if df.empty or "產業" not in df.columns:
+        return df
+    return df.sort_values("綜合分數", ascending=False).groupby("產業", group_keys=False).head(n)
+
+
+def apply_filters(df: pd.DataFrame):
+    c = M.VALUE_CRITERIA
+    base = df[~df["排除"]].copy()
+    healthy = ~base["風險標記"].str.contains("股利衰退|🔴 獲利衰退", na=False)
+    value = base[
+        healthy &
+        (base["PE"] > 0) & (base["PB"] > 0) &
+        (base["PE"] <= c["PE_上限"]) & (base["PB"] <= c["PB_上限"]) &
+        (base["殖利率"] >= c["殖利率_下限"]) &
+        (base["安全邊際%"] >= c["安全邊際_下限"]) &
+        (base["連續配發現金股利年數"] >= c["連續配息年數_下限"]) &
+        (base["盈餘發放率%"].between(c["盈餘發放率_下限"], c["盈餘發放率_上限"]))
+    ].sort_values("綜合分數", ascending=False)
+    value = cap_industry(value, 5)
+
+    c1 = M.SHEET1_CRITERIA
+    sheet1 = base[
+        (base["溢價回收年限"] <= c1["溢價回收年限_上限"]) &
+        (base["殖利率"] >= c1["殖利率_下限"]) &
+        (base["獲利率"] >= c1["獲利率_下限"]) &
+        (base["盈餘發放率%"].between(c1["盈餘發放率_下限"], c1["盈餘發放率_上限"]))
+    ].sort_values("綜合分數", ascending=False)
+
+    c2 = M.SHEET2_CRITERIA
+    sheet2 = base[
+        healthy &
+        (base["連續配發現金股利年數"] >= c2["連續配息年數_下限"]) &
+        (base["盈餘發放率%"].between(c2["盈餘發放率_下限"], c2["盈餘發放率_上限"])) &
+        (base["殖利率"] >= c2["殖利率_下限"]) &
+        (base["溢價回收年限"] <= c2["溢價回收年限_上限"]) &
+        (base["ROE%"].fillna(0) >= c2["ROE_下限"])
+    ].sort_values(["綜合分數", "連續配發現金股利年數"], ascending=False)
+    return value, sheet1, sheet2
+
+
+# ───────────────────────────────────────────
+# 欄位說明
+# ───────────────────────────────────────────
+COLUMNS = [
+    ("代號", "股票代碼", "—", "—", "識別用"),
+    ("Name", "公司名稱", "—", "—", "識別用"),
+    ("產業", "證交所產業別", "—", "—", "同產業最多取 5 檔，避免單一循環產業洗版"),
+    ("收盤價", "最近交易日收盤價（元）", "—", "—", "估價基準；不是便宜與否的判斷"),
+    ("PE", "本益比（TTM）", "市場評價高／成長股", "可能被低估或前景保守", "存股偏好 <15；PE=0 代表無獲利或無資料"),
+    ("PB", "股價淨值比", "溢價高", "接近帳面價值", "PB<1.5 較安全；0 或缺值不列入價值篩選"),
+    ("殖利率", "近 12 個月實際除息 DPS ÷ 收盤價", "現金回報高", "回報低或成長股", "與官方殖利率差 >2pp 會標記口徑差異"),
+    ("殖利率_官方", "TWSE BWIBBU 公告殖利率（基準年度可能不同）", "—", "—", "只用來對帳，不參與估價"),
+    ("EPS", "收盤價 ÷ PE（TTM）", "賺錢能力強", "獲利弱或虧損", "年度 EPS 另見「年度EPS」"),
+    ("年度EPS", "Yahoo 年度基本每股盈餘（最近年度）", "—", "—", "用於 PEG 與發放率，避免 TTM 與股利年度錯位"),
+    ("每股淨值", "TWSE 每股參考淨值（fallback：收盤÷PB）", "資產厚實", "資產單薄", "股價跌破淨值可能是機會或警訊"),
+    ("ROE%", "EPS ÷ 每股淨值 ×100", "資本效率高", "效率差", "≥8% 為基本門檻；金融股另計"),
+    ("毛利率%", "營業毛利 ÷ 營收（單季累計）", "產品附加價值高", "代工／低毛利", "與營益率一起看趨勢"),
+    ("營益率%", "營業利益 ÷ 營收", "本業賺錢", "本業薄利", "淨利率高於營益率＝業外貢獻"),
+    ("業外依賴度", "純益率 − 營益率（pp）", "業外佔比高", "本業為主", ">3pp 需查業外來源"),
+    ("負債比%", "負債總計 ÷ 資產總計", "槓桿高", "財務保守", ">65% 標記（金融保險除外）"),
+    ("月營收YoY%", "當月營收年增率", "需求強", "衰退", "比季報早 1-2 個月反映"),
+    ("累積配息年數", "歷史上有配息的年度數（Yahoo 20+ 年）", "配息經驗多", "新上市或中斷", "與連續年數並看，差距大＝中斷過"),
+    ("連續配發現金股利年數", "從最近完整年度往回，連續配息年數", "穩定性高", "曾中斷", "≥10 年為定存股黃金標準"),
+    ("dps", "近 12 個月實際除息現金股利（元）", "—", "—", "估價與殖利率的唯一分子"),
+    ("five_avg", "近 5 個完整年度平均股利（元）", "—", "—", "用於估價，避免單一年度高峰"),
+    ("股利穩定性倍數", "DPS ÷ 5 年平均", "≥1.5 高峰股利", "<0.6 股利衰退", "0.6–1.5 才是可用估值基礎"),
+    ("連續獲利年數", "年度 EPS > 0 的連續年數（Yahoo 僅 4 年）", "獲利穩定", "曾虧損", "資料年數見「獲利資料年數」，勿把 0 當虧損"),
+    ("獲利資料年數", "Yahoo 年度 EPS 覆蓋年數", "—", "—", "小於 10 年時，連續獲利只能視為下限"),
+    ("EPS成長_最新%", "最近年度 EPS YoY", "成長", "衰退", "PEG 只在 5–150% 區間有效"),
+    ("EPS成長_3年CAGR%", "最近 3 年 EPS 年複合成長", "成長", "衰退", "≤0 代表 PEG 無意義"),
+    ("PEG_A", "PE_年報 ÷ 最新年度 EPS 成長率", "—", "—", "<0.5 極便宜、0.5–1 安全、>1.5 貴；空白＝成長率不在 5–150%"),
+    ("PEG_B", "PE_年報 ÷ 3 年 EPS CAGR", "—", "—", "與 PEG_A 並看，兩個都便宜才算通過"),
+    ("溢價回收年限", "(股價 − 每股淨值) ÷ EPS", "溢價高、回本久", "折價或回本快", "負值代表股價低於淨值，不可用「<=上限」單獨判斷"),
+    ("盈餘發放率%", "DPS ÷ 年度 EPS", "配得多（>100% 借錢配息）", "保留盈餘再投資", "理想 40–90%"),
+    ("安全邊際%", "(合理價 − 現價) ÷ 合理價", "折價大", "溢價", "以 5 年平均股利估價；>20% 為優質"),
+    ("合理殖利率門檻%", "10Y 美債殖利率 + 2% 風險溢酬", "—", "—", "利率上升會讓所有合理價下移；可用 --risk-premium 調整"),
+    ("便宜價", "5 年平均股利 ÷ (門檻×1.25)", "—", "—", "現價 ≤ 便宜價＝深度折價"),
+    ("合理價", "5 年平均股利 ÷ 門檻", "—", "—", "現價 ≤ 合理價＝可考慮"),
+    ("昂貴價", "5 年平均股利 ÷ max(門檻×0.8, 2%)", "—", "—", "現價 > 昂貴價＝暫緩"),
+    ("股價位階", "現價對應便宜/合理/昂貴", "—", "—", "用 5 年平均股利，不用單一年度"),
+    ("綜合分數", "估值 35%＋品質 35%＋籌碼 15%＋動能 15%（rank 百分位）", "各方面都前段", "後段", "本次主要排序指標；覆蓋率 <50% 不給分"),
+    ("估值分", "安全邊際/殖利率/PE/PB 的 rank 平均", "便宜", "貴", "0–100"),
+    ("品質分", "ROE/負債比/毛利率/業外/配息穩定 rank 平均", "體質好", "體質差", "0–100"),
+    ("籌碼分", "外資持股變化/法人買超/外資持股 rank 平均", "資金流入", "流出", "0–100"),
+    ("動能分", "RS20/距高點/量比 rank 平均", "相對強", "相對弱", "0–100"),
+    ("外資持股%", "全體外資及陸資持股比率", "—", "—", "客觀持股水位"),
+    ("外資持股5日變化(pp)", "與 5 個交易日前相比", "加碼", "減碼", "比單日買賣超穩定"),
+    ("三大法人買超5日(張)", "外資＋投信＋自營 5 日累計", "買方", "賣方", "含 ETF 對沖，不等於方向性"),
+    ("三大法人買超20日(張)", "20 日累計", "持續買", "持續賣", "搭配股價位置看"),
+    ("融資使用率%", "融資餘額 ÷ 融資限額", "散戶槓桿高", "低", ">20% 留意追繳壓力"),
+    ("券資比%", "融券餘額 ÷ 融資餘額", "空方多", "空方少", "高券資比可能有軋空也可能真的弱"),
+    ("量比", "今日量 ÷ 前 20 日均量", "帶量", "縮量", "<1 縮量、1–1.3 微增、1.3–1.8 明顯帶量、>1.8 大量"),
+    ("ATR14", "14 日平均真實區間（元）", "波動大", "波動小", "停損距離＝ATR×1.5～2"),
+    ("ATR%", "ATR14 ÷ 收盤價", "波動大", "波動小", "部位上限＝1% ÷ 停損幅度"),
+    ("距60日高點%", "現價相對 60 日最高", "接近高點", "深度回檔", "−10% 內＝強勢；<−30% 需確認基本面"),
+    ("RS20", "個股 20 日報酬 − 大盤 20 日報酬（pp）", "強於大盤", "弱於大盤", "橫斷面選股比絕對均線訊號有用"),
+    ("均線帶寬%", "16/20/25/45/60MA 的最大展開幅度", "發散（趨勢）", "糾結（箱型）", "<1% 視為糾結，未帶量突破不進場"),
+    ("二日法則_20MA", "20MA 穿越後次日確認結果", "—", "—", "真突破/假突破/真跌破/假跌破；空白＝近日無穿越"),
+    ("風險標記", "負面條件彙總", "—", "—", "KY/裁處/流動性不足會直接排除；建商、景氣循環、業外依賴等會扣分"),
+    ("風險扣分", "風險標記對綜合分數的扣分", "—", "—", "股利衰退 -8、獲利衰退 -10、建商 -8、負債偏高 -6…"),
+    ("資料狀態", "各模組資料是否成功取得", "—", "—", "⚠️ 代表該模組缺資料，不是 0"),
 ]
 
 
+def column_definitions():
+    return [{"欄位名稱": n, "定義": d, "數值越大代表": hi, "數值越小代表": lo, "存股參考": ref}
+            for n, d, hi, lo, ref in COLUMNS]
+
+
 # ───────────────────────────────────────────
-# 7. JSON 快照輸出（供 Web UI 載入；xlsx 改由前端匯出）
+# 輸出
 # ───────────────────────────────────────────
-def _df_to_records(df: pd.DataFrame) -> list:
-    """DataFrame → list[dict]，正確處理 numpy 型別與 NaN（NaN → null）"""
-    return json.loads(df.to_json(orient='records', force_ascii=False))
+def df_to_records(df: pd.DataFrame) -> list[dict]:
+    clean = df.replace({np.nan: None, pd.NaT: None})
+    out = []
+    for rec in clean.to_dict(orient="records"):
+        row = {}
+        for k, v in rec.items():
+            if isinstance(v, np.integer):
+                v = int(v)
+            elif isinstance(v, np.floating):
+                v = None if pd.isna(v) else float(v)
+            elif isinstance(v, (pd.Timestamp, datetime)):
+                v = str(v)
+            row[k] = v
+        out.append(row)
+    return out
 
 
-def export_to_json(value_sheet: pd.DataFrame, sheet1: pd.DataFrame, sheet2: pd.DataFrame, df_all: pd.DataFrame,
-                   data_dir: str = DATA_DIR) -> tuple:
-    """寫出一份帶時間戳的快照 JSON，並更新 manifest。回傳 (快照路徑, generated_at_iso)。
-
-    快照結構（前端與『個股追蹤』皆依賴此格式，欄位請保持穩定）：
-      {
-        generated_at:    ISO8601 時間戳（排序、追蹤用）
-        generated_at_display: 人類可讀時間
-        screener_version, twstock_enabled,
-        column_definitions: [...],
-        sheets: { value|sheet1|sheet2|all: { title, criteria, rows: [...] } }  # all = 全市場未篩選
-      }
-    """
+def export_snapshot(sheets: dict, meta: dict, data_dir=DATA_DIR) -> str:
     os.makedirs(data_dir, exist_ok=True)
     now = datetime.now()
-    generated_at = now.isoformat(timespec='seconds')
-
-    sheets_df = {'value': value_sheet, 'sheet1': sheet1, 'sheet2': sheet2,
-                 'all': df_all.sort_values('代號')}
-    snapshot = {
-        'generated_at': generated_at,
-        'generated_at_display': now.strftime('%Y-%m-%d %H:%M:%S'),
-        'screener_version': SCREENER_VERSION,
-        'twstock_enabled': TWSTOCK_AVAILABLE,
-        'history_enriched': HISTORY_USED,
-        'column_definitions': COLUMN_DEFINITIONS,
-        'sheets': {
-            key: {
-                'title': SHEET_META[key]['title'],
-                'criteria': SHEET_META[key]['criteria'],
-                'rows': _df_to_records(df),
-            }
-            for key, df in sheets_df.items()
-        },
+    snap = {
+        "generated_at": now.isoformat(timespec="seconds"),
+        "generated_at_display": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "screener_version": SCREENER_VERSION,
+        "twstock_enabled": False,
+        "history_enriched": True,
+        "meta": meta,
+        "column_definitions": column_definitions(),
+        "sheets": sheets,
     }
-
     fname = f"snapshot_{now.strftime('%Y%m%d_%H%M%S')}.json"
-    fpath = os.path.join(data_dir, fname)
-    with open(fpath, 'w', encoding='utf-8') as f:
-        json.dump(snapshot, f, ensure_ascii=False, separators=(',', ':'))  # 精簡：含全市場後檔案變大
-
-    _update_manifest(data_dir, fname, snapshot)
-    return fpath, generated_at
+    path = os.path.join(data_dir, fname)
+    S.save_json(path, snap)
+    _update_manifest(data_dir, fname, snap)
+    return path
 
 
-def _update_manifest(data_dir: str, fname: str, snapshot: dict):
-    """維護 manifest.json：最新在前，供 Web UI 列出歷史快照可供切換/比較。"""
-    manifest_path = os.path.join(data_dir, MANIFEST_FILENAME)
-    try:
-        with open(manifest_path, encoding='utf-8') as f:
-            manifest = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        manifest = {'snapshots': []}
-
-    entry = {
-        'file': fname,
-        'generated_at': snapshot['generated_at'],
-        'generated_at_display': snapshot['generated_at_display'],
-        'counts': {k: len(v['rows']) for k, v in snapshot['sheets'].items()},
-    }
-    # 去除同檔重複後插到最前
-    manifest['snapshots'] = [s for s in manifest['snapshots'] if s.get('file') != fname]
-    manifest['snapshots'].insert(0, entry)
-
-    with open(manifest_path, 'w', encoding='utf-8') as f:
-        json.dump(manifest, f, ensure_ascii=False, indent=2)
+def _update_manifest(data_dir, fname, snap):
+    path = os.path.join(data_dir, MANIFEST)
+    man = S.load_json(path, {"snapshots": []})
+    entry = {"file": fname, "generated_at": snap["generated_at"],
+             "generated_at_display": snap["generated_at_display"],
+             "counts": {k: len(v["rows"]) for k, v in snap["sheets"].items()},
+             "data_date": snap["meta"].get("data_date")}
+    man["snapshots"] = [s for s in man["snapshots"] if s.get("file") != fname]
+    man["snapshots"].insert(0, entry)
+    S.save_json(path, man)
 
 
 # ───────────────────────────────────────────
 # 主程式
 # ───────────────────────────────────────────
-def run_ultimate_dividend_screener():
+def run(args):
     t0 = time.perf_counter()
+    print(f"🔍 台股存股選股器 v{SCREENER_VERSION}")
 
-    print("🔍 [1/7] 啟動終極選股器：建立連線池 + 多執行緒抓取中...")
-    # 1) 多執行緒抓取
-    session = _build_session()
-    data_frames = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-        futures = {
-            pool.submit(fetch_endpoint, session, key, path): key
-            for key, path in ENDPOINTS.items()
-        }
-        for future in concurrent.futures.as_completed(futures):
-            key, df = future.result()
-            data_frames[key] = df
+    frames, status = S.fetch_all_openapi()
+    missing = [k for k, v in frames.items() if v is None]
+    if missing:
+        print(f"❌ 必要端點失敗：{', '.join(missing)}")
+        return 1
 
-    # 驗證
-    failed = [k for k, v in data_frames.items() if v is None]
-    if failed:
-        print(f"❌ 以下端點抓取失敗：{', '.join(failed)}，請檢查網路或稍後再試。")
-        return
+    us10y, ten_status = (4.5, "offline") if args.offline else S.fetch_us10y()
+    print(f"🏦 10Y 美債 {us10y}%（{ten_status}）→ 合理殖利率門檻 "
+          f"{M.target_yield(us10y, args.risk_premium)[0] * 100:.2f}%")
 
-    # 2) 統一代號欄位
-    print("🧹 [2/7] 資料清理與股息邏輯重構 (季配息加總 + 連續配息計算)...")
-    for key in data_frames:
-        data_frames[key] = normalize_code_column(data_frames[key])
-
-    # 3) 股利處理
-    df_streak, df_latest_div = process_dividends(data_frames['div_hist'])
-
-    # 4) 合併 + 計算
-    print("⚙️ [3/7] 向量化高速運算 (EPS, 估價, 安全邊際, 投資CP值)...")
-    df_all = build_master_table(
-        data_frames['metrics'],
-        data_frames['profit'],
-        data_frames['prices'],
-        df_streak,
-        df_latest_div,
-    )
-
-    # 4b) FinMind 多年歷史補強（手動啟用：FINMIND=1）
-    if ENABLE_HISTORY:
-        print("🌐 [4b] FinMind 多年歷史補強（覆蓋累積/連續配息年數、最新股利、連續獲利年數）...")
-        df_all = enrich_with_finmind(df_all)
+    if args.offline:
+        market_hist, taiex, ndays = {}, {}, 0
+        print("  ⏭️  offline：跳過日行情")
     else:
-        print("ℹ️  歷史補強未啟用（如需多年配息/獲利資料：FINMIND=1 python3 stock_screener.py）")
+        print("📅 抓取全市場日行情（OHLCV）…")
+        market_hist, taiex, ndays = S.load_market_history(args.days)
 
-    # 5) 三軌篩選
-    print("📊 [4/7] 三軌條件篩選 (價值投資 + 廣泛清單 + 防禦存股)...")
-    value_sheet, sheet1, sheet2 = apply_filters(df_all)
+    chips = {}
+    if not args.offline and not args.no_chips:
+        print("📊 抓取籌碼（T86／融資券／外資持股）…")
+        try:
+            chips = S.load_chip_history(21)
+        except Exception as e:
+            print(f"  ⚠️  籌碼模組降級：{e}")
 
-    # 6) twstock 個股分析
-    if TWSTOCK_AVAILABLE:
-        print("🔍 [5/7] 技術分析（TWSE 日行情 → 四大買賣點 + 均線，全市場）...")
-        hist = load_daily_history()
-        analysis_map = {c: _analyze_history(hist.get(c, [])) for c in df_all['代號']}
-        value_sheet = enrich_with_twstock(value_sheet, analysis_map)
-        sheet1 = enrich_with_twstock(sheet1, analysis_map)
-        sheet2 = enrich_with_twstock(sheet2, analysis_map)
-        df_all = enrich_with_twstock(df_all, analysis_map)
-    else:
-        print("⚠️ [5/7] twstock 不可用，跳過個股分析")
+    yahoo = {}
+    if args.seed:
+        yahoo = S.import_legacy_cache(args.seed)
+    if not args.offline and not args.no_yahoo:
+        print("🌐 抓取 Yahoo 股利（20+ 年）與年度 EPS…")
+        # EPS 只抓成交金額前 500 檔（其餘留 null，不假裝 0）
+        by_amount = sorted(
+            ((str(c), (rows[-1][5] if rows and len(rows[-1]) >= 6 else 0))
+             for c, rows in market_hist.items()),
+            key=lambda x: -(x[1] or 0))[:500]
+        eps_codes = {c for c, _ in by_amount}
+        try:
+            yahoo = S.build_yahoo_history([str(c) for c in frames["metrics"]["代號"]],
+                                          eps_codes=eps_codes, workers=args.workers)
+        except Exception as e:
+            print(f"  ⚠️  Yahoo 模組降級：{e}")
 
-    # 7) 輸出 JSON 快照（xlsx 改由 Web UI 匯出）
-    print("💾 [6/7] 輸出 JSON 快照...")
-    fpath, generated_at = export_to_json(value_sheet, sheet1, sheet2, df_all)
+    print("⚙️  合併與計算…")
+    df = build_master(frames, status, us10y, market_hist, taiex, chips, yahoo, status,
+                      args.risk_premium)
 
-    elapsed = time.perf_counter() - t0
-    twstock_status = '✅ 已整合' if TWSTOCK_AVAILABLE else '❌ 未整合'
-    print(f"\n✅ [7/7] 大功告成！耗時 {elapsed:.1f} 秒 → {fpath}")
-    print(f"   🕒 產生時間 {generated_at} | twstock {twstock_status}")
-    print(f"   💎 價值投資精選: {len(value_sheet)} 家 ← 安全邊際排序")
-    print(f"   📈 廣泛價值標的: {len(sheet1)} 家")
-    print(f"   🛡️ 嚴選防禦標的: {len(sheet2)} 家")
-    print(f"   🌐 全市場: {len(df_all)} 家")
-    print(f"   🌐 檢視：python3 server.py 後開 http://localhost:8000（或雙擊 啟動.command）")
+    value, sheet1, sheet2 = apply_filters(df)
+    print(f"  💎 價值精選 {len(value)}｜📈 廣泛 {len(sheet1)}｜🛡️ 防禦 {len(sheet2)}"
+          f"｜🌐 全市場 {len(df)}")
+
+    data_date = str(frames["metrics"]["Date"].max())
+    if len(data_date) == 7:
+        data_date = f"{int(data_date[:3]) + 1911}-{data_date[3:5]}-{data_date[5:7]}"
+    meta = {"data_date": data_date, "us10y": us10y,
+            "target_yield_pct": round(M.target_yield(us10y, args.risk_premium)[0] * 100, 2),
+            "risk_premium_pct": round(args.risk_premium * 100, 2),
+            "history_days": ndays, "offline": args.offline,
+            "source_status": status,
+            "criteria": {"value": M.VALUE_CRITERIA, "sheet1": M.SHEET1_CRITERIA,
+                         "sheet2": M.SHEET2_CRITERIA}}
+
+    titles = {"value": "💎 價值投資精選", "sheet1": "📈 廣泛價值清單",
+              "sheet2": "🛡️ 嚴選防禦存股", "all": "🌐 全市場"}
+    drop_cols = {"權益總計", "每股參考淨值", "股利合計_官方", "資料日期",
+                 "營收年月", "歷史交易日數", "PE_年報", "EPS_年化", "排除"}
+    sheets = {}
+    for key, sub in (("value", value), ("sheet1", sheet1), ("sheet2", sheet2),
+                     ("all", df.sort_values("代號"))):
+        sub = sub.drop(columns=[c for c in drop_cols if c in sub.columns])
+        sheets[key] = {"title": titles[key],
+                       "criteria": meta["criteria"].get(key, {}),
+                       "rows": df_to_records(sub)}
+
+    path = export_snapshot(sheets, meta)
+    print(f"\n✅ 完成（{time.perf_counter() - t0:.1f}s）→ {path}")
+    print(f"   🕒 資料基準日 {data_date}｜合理殖利率 {meta['target_yield_pct']}%")
+    print("   🌐 python3 server.py 後開 http://localhost:8000/index.html")
+    return 0
 
 
-# ───────────────────────────────────────────
-if __name__ == '__main__':
-    run_ultimate_dividend_screener()
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--days", type=int, default=80, help="技術面回看交易日（預設 80）")
+    ap.add_argument("--workers", type=int, default=6, help="Yahoo 抓取執行緒")
+    ap.add_argument("--no-yahoo", action="store_true")
+    ap.add_argument("--no-chips", action="store_true")
+    ap.add_argument("--offline", action="store_true")
+    ap.add_argument("--seed", help="匯入舊版 dividend_cache_v8.json 作為股利種子")
+    ap.add_argument("--risk-premium", type=float, default=M.RISK_PREMIUM,
+                    help="目標殖利率的風險溢酬（預設 0.02 = 2%%）")
+    args = ap.parse_args()
+    raise SystemExit(run(args))
+
+
+if __name__ == "__main__":
+    main()
