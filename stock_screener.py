@@ -93,7 +93,7 @@ def twse_dividend_events(div_df: pd.DataFrame) -> dict[str, list[dict]]:
 # 主表
 # ───────────────────────────────────────────
 def build_master(frames, status, us10y, market_hist, taiex, chips,
-                 yahoo, source_status, premium=None) -> pd.DataFrame:
+                 yahoo, source_status, premium=None, twt49u=None) -> pd.DataFrame:
     met = frames["metrics"].copy()
     met["PE"] = pd.to_numeric(met["PEratio"].replace("-", np.nan), errors="coerce")
     met["PB"] = pd.to_numeric(met["PBratio"].replace("-", np.nan), errors="coerce")
@@ -179,13 +179,17 @@ def build_master(frames, status, us10y, market_hist, taiex, chips,
         y = yahoo.get(code) or {}
         divs = y.get("divs") or []
         dstatus = y.get("div_status", "error")
+        if (twt49u or {}).get(code):                  # TWSE 官方除息歷史優先（無 429）
+            divs, dstatus = twt49u[code], "ok"
         if not divs and twse_events.get(code):
             divs, dstatus = twse_events[code], "twse_fallback"
         dstats = M.dividend_stats(divs, date.today())
         estats = M.eps_stats(y.get("eps") or {})
         tech = M.technical_stats(market_hist.get(code, []), tx_closes)
         chip = S.chip_summary(chips, code) if chips else {}
+        mixed = sum(1 for e in divs if e.get("mixed") and e["date"][:4] >= str(date.today().year - 5))
         recs.append({**dstats, **estats, **tech, **chip,
+                     "股利含配股筆數": mixed,
                      "股利資料狀態": dstatus,
                      "獲利資料狀態": y.get("eps_status", "error"),
                      "歷史交易日數": len(market_hist.get(code, []))})
@@ -465,8 +469,15 @@ def run(args):
             print(f"  ⚠️  Yahoo 模組降級：{e}")
 
     print("⚙️  合併與計算…")
+    print("💰 抓取 TWSE 除息歷史（TWT49U）…")
+    try:
+        twt49u = S.load_twse_dividend_history(offline=args.offline)
+    except Exception as e:
+        twt49u = {}
+        print(f"  ⚠️  TWT49U 模組降級：{e}")
+
     df = build_master(frames, status, us10y, market_hist, taiex, chips, yahoo, status,
-                      args.risk_premium)
+                      args.risk_premium, twt49u)
 
     value, sheet1, sheet2 = apply_filters(df)
     print(f"  💎 價值精選 {len(value)}｜📈 廣泛 {len(sheet1)}｜🛡️ 防禦 {len(sheet2)}"

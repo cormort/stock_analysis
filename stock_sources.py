@@ -301,6 +301,79 @@ def build_yahoo_history(codes: list[str], cache_path=f"{DATA_DIR}/yahoo_hist.jso
 
 
 # ───────────────────────────────────────────
+# TWSE 除權除息計算結果表（TWT49U）：全市場 20 年除息事件，一年一請求
+# ───────────────────────────────────────────
+TWT49U_CACHE = f"{DATA_DIR}/twt49u.json"
+
+
+def parse_twt49u(j: dict) -> list[list]:
+    """→ [[code, 'YYYY-MM-DD', 現金股利, mixed]]。
+
+    早年有獨立「息值」欄（精確）；近年只有「權值+息值」：
+      權/息 = '息' → 即現金股利；'權息' → 配股+配息合計，無法拆 → mixed=True（金額偏高）；
+      '權' → 純配股，略過。
+    """
+    f = j.get("fields") or []
+    if "股票代號" not in f or "資料日期" not in f:
+        return []
+    i_code, i_date = f.index("股票代號"), f.index("資料日期")
+    i_cash = f.index("息值") if "息值" in f else None
+    i_sum = f.index("權值+息值") if "權值+息值" in f else None
+    i_kind = f.index("權/息") if "權/息" in f else None
+    out = []
+    for r in j.get("data") or []:
+        try:
+            y, m, d = (int(x) for x in str(r[i_date]).replace("年", "-").replace("月", "-")
+                       .replace("日", "").split("-"))
+            day = f"{y + 1911:04d}-{m:02d}-{d:02d}"
+            kind = str(r[i_kind]) if i_kind is not None else ""
+            if i_cash is not None:
+                cash, mixed = _num(r[i_cash]), False
+            elif kind == "息":
+                cash, mixed = _num(r[i_sum]), False
+            elif kind == "權息":
+                cash, mixed = _num(r[i_sum]), True
+            else:
+                continue
+            if cash and cash > 0:
+                out.append([str(r[i_code]).strip(), day, round(cash, 4), mixed])
+        except Exception:
+            continue
+    return out
+
+
+def load_twse_dividend_history(start_year: int = 2003, offline: bool = False) -> dict:
+    """{code: [{'date', 'amount', 'mixed'}]}；過去年度永久快取，今年每次重抓。"""
+    cache = load_json(TWT49U_CACHE, {})
+    this_year = date.today().year
+    fetched = 0
+    for y in range(start_year, this_year + 1):
+        if offline or (str(y) in cache and y < this_year):
+            continue
+        start = f"{y}0505" if y == 2003 else f"{y}0101"   # TWT49U 最早 92/5/5
+        j = _rwd_json("exRight/TWT49U", {"startDate": start, "endDate": f"{y}1231",
+                                         "response": "json"})
+        if not j:                                     # 網路錯誤或「系統忙碌」：不寫快取，下次重試
+            print(f"    ⚠️  TWT49U {y} 抓取失敗")
+            continue
+        cache[str(y)] = parse_twt49u(j)
+        fetched += 1
+        print(f"\r    除息 {y}（{len(cache[str(y)])} 筆）", end="")
+        time.sleep(1.5)
+    if fetched:
+        print()
+        save_json(TWT49U_CACHE, cache)
+    out: dict[str, list[dict]] = {}
+    for rows in cache.values():
+        for code, d, amt, mixed in rows:
+            out.setdefault(code, []).append({"date": d, "amount": amt, "mixed": mixed})
+    for v in out.values():
+        v.sort(key=lambda e: e["date"])
+    print(f"  💰 TWT49U 除息歷史 {len(cache)} 年（新抓 {fetched} 年），{len(out)} 檔")
+    return out
+
+
+# ───────────────────────────────────────────
 # 全市場日行情（MI_INDEX）：OHLCV + 成交金額 + 大盤指數
 # ───────────────────────────────────────────
 MI_INDEX_URL = f"{RWD_BASE}/afterTrading/MI_INDEX"

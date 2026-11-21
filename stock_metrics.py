@@ -416,6 +416,8 @@ def risk_flags(row: pd.Series, penalty_codes: set[str]) -> str:
             f.append("高峰股利")
         elif stab < 0.6:
             f.append("股利衰退")
+    if (_f(row.get("股利含配股筆數")) or 0) > 0:
+        f.append("股利含配股(金額偏高)")   # TWT49U 權息合計無法拆現金
     extra = _f(row.get("業外依賴度"))
     if extra is not None and extra > 3:
         f.append("業外依賴")
