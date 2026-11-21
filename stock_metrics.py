@@ -21,7 +21,7 @@ PAYOUT_MIN, PAYOUT_MAX = 30.0, 110.0
 
 VALUE_CRITERIA = {
     "PE_上限": MAX_PE, "PB_上限": MAX_PB, "殖利率_下限": MIN_YIELD,
-    "盈餘發放率_下限": PAYOUT_MIN, "盈餘發放率_上限": PAYOUT_MAX,
+    "盈餘發放率_下限": PAYOUT_MIN, "盈餘發放率_上限": 100.0,
     "連續配息年數_下限": 5, "安全邊際_下限": 0,
 }
 SHEET1_CRITERIA = {
@@ -265,11 +265,20 @@ def target_yield(us10y: float, premium: float | None = None) -> tuple[float, flo
 
 
 def valuation_metrics(dps, five_avg, price, us10y, premium: float | None = None):
+    """安全邊際用保守股利：min(現行 TTM DPS, 5 年均)。
+
+    只取 5 年均會在股利被砍 30% 時仍用舊高檔估價，製造假的安全邊際；
+    只取現行 DPS 則會被一次性高配誤導。兩者取小是保守做法。
+    """
     fair_y, cheap_y, exp_y = target_yield(us10y, premium)
-    div = five_avg if five_avg and five_avg > 0 else (dps if dps and dps > 0 else None)
+    avg = five_avg if five_avg and five_avg > 0 else None
+    # dps=0 代表「有除息紀錄但近一年沒配」＝停發，不可退回 5 年均假裝還有股利
+    cur = max(dps, 0) if dps is not None else None
+    div = min(avg, cur) if avg is not None and cur is not None else (avg or cur)
     if not div or not price:
         return {"便宜價": None, "合理價": None, "昂貴價": None, "安全邊際%": None,
-                "股價位階": "—", "合理殖利率門檻%": round(fair_y * 100, 2)}
+                "股價位階": "—", "合理殖利率門檻%": round(fair_y * 100, 2),
+                "估值股利": None}
     cheap, fair, exp = div / cheap_y, div / fair_y, div / exp_y
     mos = (fair - price) / fair * 100
     if price <= cheap:
@@ -282,7 +291,15 @@ def valuation_metrics(dps, five_avg, price, us10y, premium: float | None = None)
         level = "🔴 昂貴"
     return {"便宜價": round(cheap, 2), "合理價": round(fair, 2), "昂貴價": round(exp, 2),
             "安全邊際%": round(mos, 2), "股價位階": level,
-            "合理殖利率門檻%": round(fair_y * 100, 2)}
+            "合理殖利率門檻%": round(fair_y * 100, 2), "估值股利": round(div, 4)}
+
+
+def payout_ratio(dps, eps_ttm, eps_annual):
+    """發放率優先用 TTM EPS；TTM 缺值才退回年度 EPS（避免用去年高峰 EPS 低估配息壓力）。"""
+    base = eps_ttm if eps_ttm and eps_ttm > 0 else eps_annual
+    if not dps or not base or base <= 0:
+        return None
+    return round(dps / base * 100, 2)
 
 
 # ───────────────────────────────────────────
@@ -414,7 +431,7 @@ def risk_flags(row: pd.Series, penalty_codes: set[str]) -> str:
     if stab is not None:
         if stab >= 1.5:
             f.append("高峰股利")
-        elif stab < 0.6:
+        elif stab < 0.8:
             f.append("股利衰退")
     if (_f(row.get("股利含配股筆數")) or 0) > 0:
         f.append("股利含配股(金額偏高)")   # TWT49U 權息合計無法拆現金

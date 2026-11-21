@@ -73,10 +73,33 @@ def test_valuation_uses_5y_average_and_flags_level():
     assert v["安全邊際%"] > 0
 
 
+def test_valuation_uses_current_dps_when_below_average():
+    """股利被砍時不能用 5 年均舊高檔算安全邊際（2204 案例）。"""
+    v = M.valuation_metrics(dps=3.6, five_avg=5.34, price=46.95, us10y=4.92)
+    assert v["估值股利"] == 3.6
+    assert 9.0 < v["安全邊際%"] < 11.0     # 不是舊版的 39%
+
+
+def test_payout_ratio_prefers_ttm_eps():
+    assert M.payout_ratio(4.5692, 4.26, 5.71) == 107.26
+    assert M.payout_ratio(4.5692, None, 5.71) == 80.02
+
+
+def test_risk_flags_marks_20pct_dividend_cut():
+    row = pd.Series({"代號": "2204", "Name": "中華", "股利穩定性倍數": 0.67})
+    assert "股利衰退" in M.risk_flags(row, set())
+
+
 def test_valuation_missing_dividend_is_dash_not_expensive():
     v = M.valuation_metrics(None, None, 100, 4.5)
     assert v["股價位階"] == "—"
     assert v["安全邊際%"] is None
+
+
+def test_valuation_suspended_dividend_does_not_fall_back_to_average():
+    v = M.valuation_metrics(0.0, 5.0, 100, 4.5)
+    assert v["估值股利"] is None
+    assert v["股價位階"] == "—"
 
 
 def test_rank_score_higher_is_better():

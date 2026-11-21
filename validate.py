@@ -89,6 +89,8 @@ def main():
            if (r.get("PE") or 0) <= 0 or (r.get("PB") or 0) <= 0
            or (r.get("PE") or 99) > 15 or (r.get("PB") or 99) > 2
            or (r.get("安全邊際%") is None) or r["安全邊際%"] < 0
+           or (r.get("盈餘發放率%") is None) or r["盈餘發放率%"] > 100
+           or (r.get("股利穩定性倍數") or 1) < 0.8
            or (r.get("連續配發現金股利年數") or 0) < 5]
     add("PASS" if not bad else "FAIL", "價值清單門檻一致性",
         f"{len(value)} 檔，違反門檻 {len(bad)} 檔" + (f"：{bad[:6]}" if bad else ""))
