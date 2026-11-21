@@ -350,8 +350,10 @@ function render(snap) {
   document.getElementById('loadHint').style.display = 'none';
   document.getElementById('emptyMsg').style.display = 'none';
   const tw = snap.twstock_enabled ? '✅ 含技術分析' : '📐 內建技術指標';
-  const gi = snap.history_enriched ? '✅ 多年股利/獲利' : '📅 近 2 年股利';
   const m = snap.meta || {};
+  const gi = m.div_coverage_pct != null
+    ? `股利 20 年完整度 ${m.div_coverage_pct}%`
+    : (snap.history_enriched ? '✅ 多年股利/獲利' : '📅 近 2 年股利');
   const extra = [];
   if (m.data_date) extra.push(`資料日 ${m.data_date}`);
   if (m.target_yield_pct) extra.push(`合理殖利率 ${m.target_yield_pct}%`);
@@ -568,7 +570,11 @@ function renderWatchList() {
 
 function inOutLatest() {
   if (trackHistory.length < 2) return null;
-  const cur = trackHistory[trackHistory.length - 1], prev = trackHistory[trackHistory.length - 2];
+  const cur = trackHistory[trackHistory.length - 1];
+  // 只跟同版本快照比，避免 v5→v6 欄位/門檻變動造成滿屏「退榜」
+  const same = trackHistory.filter(s => s.screener_version === cur.screener_version);
+  if (same.length < 2) return null;
+  const prev = same[same.length - 2];
   const codesOf = (snap, k) => new Set((snap.sheets[k] ? snap.sheets[k].rows : []).map(r => String(r['代號'])));
   const result = {};
   ['value', 'sheet1', 'sheet2'].forEach(k => {
