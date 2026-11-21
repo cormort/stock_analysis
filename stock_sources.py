@@ -8,6 +8,8 @@
 from __future__ import annotations
 
 import concurrent.futures
+import csv
+import io
 import json
 import os
 import time
@@ -123,16 +125,21 @@ def fetch_us10y(cache_path=f"{DATA_DIR}/us10y.json") -> tuple[float, str]:
     cached = load_json(cache_path, {})
     if cached.get("ts") and time.time() - cached["ts"] < 86400 and cached.get("value"):
         return float(cached["value"]), "cache"
+    # 美國財政部每日殖利率曲線 CSV（官方、免 key；第一列為最新日）；年初尚無資料時退到去年
     try:
-        r = SESSION.get("https://query1.finance.yahoo.com/v8/finance/chart/%5ETNX"
-                        "?range=5d&interval=1d", timeout=20)
-        closes = [c for c in r.json()["chart"]["result"][0]["indicators"]["quote"][0]["close"] if c]
-        if closes:
-            val = round(float(closes[-1]), 3)
-            save_json(cache_path, {"value": val, "ts": time.time()})
-            return val, "ok"
+        for y in (date.today().year, date.today().year - 1):
+            r = SESSION.get("https://home.treasury.gov/resource-center/data-chart-center/interest-rates/"
+                            f"daily-treasury-rates.csv/{y}/all",
+                            params={"type": "daily_treasury_yield_curve",
+                                    "field_tdr_date_value": y, "_format": "csv"}, timeout=20)
+            rows = list(csv.DictReader(io.StringIO(r.text)))
+            if rows and rows[0].get("10 Yr"):
+                val = round(float(rows[0]["10 Yr"]), 3)
+                save_json(cache_path, {"value": val, "date": rows[0].get("Date"), "ts": time.time()})
+                return val, "ok"
+        raise ValueError("Treasury CSV 無 10 Yr 資料")
     except Exception as e:
-        print(f"  ⚠️  10Y 殖利率抓取失敗（{e}），沿用 4.5% 備援")
+        print(f"  ⚠️  10Y 殖利率抓取失敗（{e}），沿用快取或 4.5% 備援")
     return float(cached.get("value") or 4.5), "fallback"
 
 
@@ -298,6 +305,70 @@ def build_yahoo_history(codes: list[str], cache_path=f"{DATA_DIR}/yahoo_hist.jso
         time.sleep(2)
     save_json(cache_path, cache)
     return cache
+
+
+# ───────────────────────────────────────────
+# MOPS 綜合損益表彙總表（t163sb04）：全上市公司年度 EPS，一年一請求
+# ───────────────────────────────────────────
+MOPS_EPS_CACHE = f"{DATA_DIR}/mops_eps.json"
+MOPS_T163SB04 = "https://mopsov.twse.com.tw/mops/web/ajax_t163sb04"
+
+
+def parse_mops_eps(html: str) -> dict:
+    """彙總表 HTML（依產業格式分多張表）→ {code: 基本每股盈餘}。"""
+    out = {}
+    try:
+        tables = pd.read_html(io.StringIO(html), flavor="lxml")
+    except ValueError:                                # 無 <table>：尚未公告或查詢被拒
+        return out
+    for t in tables:
+        eps_col = next((c for c in t.columns if "基本每股盈餘" in str(c)), None)
+        if eps_col is None:
+            continue
+        for code, eps in zip(t[t.columns[0]], t[eps_col]):
+            v = _num(eps)
+            try:
+                code = str(int(float(code)))
+            except (TypeError, ValueError):
+                code = str(code).strip()
+            if v is not None and code:
+                out[code] = v
+    return out
+
+
+def load_mops_eps(n_years: int = 12, offline: bool = False) -> dict:
+    """{code: {西元年: EPS}}；第 4 季累計＝全年。過去年度永久快取，未公告的年度不寫快取。"""
+    cache = load_json(MOPS_EPS_CACHE, {})
+    this_year = date.today().year
+    fetched = 0
+    for y in range(this_year - n_years, this_year):
+        if offline or str(y) in cache:
+            continue
+        try:
+            r = SESSION.post(MOPS_T163SB04, timeout=40, data={
+                "encodeURIComponent": 1, "step": 1, "firstin": 1, "off": 1, "isQuery": "Y",
+                "TYPEK": "sii", "year": y - 1911, "season": "04"})
+            r.encoding = "utf-8"
+            eps = parse_mops_eps(r.text)
+        except Exception as e:
+            print(f"    ⚠️  MOPS EPS {y} 抓取失敗（{e}）")
+            continue
+        if len(eps) < 100:                            # 去年年報約 3 月底才齊；查詢過頻也會回空頁
+            print(f"    ⚠️  MOPS EPS {y} 尚無資料（{len(eps)} 筆），下次重試")
+            continue
+        cache[str(y)] = eps
+        fetched += 1
+        print(f"\r    EPS {y}（{len(eps)} 筆）", end="")
+        time.sleep(3)
+    if fetched:
+        print()
+        save_json(MOPS_EPS_CACHE, cache)
+    out: dict[str, dict] = {}
+    for y, rows in cache.items():
+        for code, v in rows.items():
+            out.setdefault(code, {})[int(y)] = v
+    print(f"  📈 MOPS 年度 EPS {len(cache)} 年（新抓 {fetched} 年），{len(out)} 檔")
+    return out
 
 
 # ───────────────────────────────────────────

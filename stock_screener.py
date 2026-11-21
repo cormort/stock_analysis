@@ -93,7 +93,7 @@ def twse_dividend_events(div_df: pd.DataFrame) -> dict[str, list[dict]]:
 # 主表
 # ───────────────────────────────────────────
 def build_master(frames, status, us10y, market_hist, taiex, chips,
-                 yahoo, source_status, premium=None, twt49u=None) -> pd.DataFrame:
+                 yahoo, source_status, premium=None, twt49u=None, mops_eps=None) -> pd.DataFrame:
     met = frames["metrics"].copy()
     met["PE"] = pd.to_numeric(met["PEratio"].replace("-", np.nan), errors="coerce")
     met["PB"] = pd.to_numeric(met["PBratio"].replace("-", np.nan), errors="coerce")
@@ -184,14 +184,15 @@ def build_master(frames, status, us10y, market_hist, taiex, chips,
         if not divs and twse_events.get(code):
             divs, dstatus = twse_events[code], "twse_fallback"
         dstats = M.dividend_stats(divs, date.today())
-        estats = M.eps_stats(y.get("eps") or {})
+        eps_hist = (mops_eps or {}).get(code)          # MOPS 官方年度 EPS 優先（12 年）
+        estats = M.eps_stats(eps_hist or y.get("eps") or {})
         tech = M.technical_stats(market_hist.get(code, []), tx_closes)
         chip = S.chip_summary(chips, code) if chips else {}
         mixed = sum(1 for e in divs if e.get("mixed") and e["date"][:4] >= str(date.today().year - 5))
         recs.append({**dstats, **estats, **tech, **chip,
                      "股利含配股筆數": mixed,
                      "股利資料狀態": dstatus,
-                     "獲利資料狀態": y.get("eps_status", "error"),
+                     "獲利資料狀態": "ok" if eps_hist else y.get("eps_status", "error"),
                      "歷史交易日數": len(market_hist.get(code, []))})
 
     df = pd.concat([df, pd.DataFrame(recs)], axis=1)
@@ -475,9 +476,15 @@ def run(args):
     except Exception as e:
         twt49u = {}
         print(f"  ⚠️  TWT49U 模組降級：{e}")
+    print("📈 抓取 MOPS 年度 EPS（t163sb04）…")
+    try:
+        mops_eps = S.load_mops_eps(offline=args.offline)
+    except Exception as e:
+        mops_eps = {}
+        print(f"  ⚠️  MOPS EPS 模組降級：{e}")
 
     df = build_master(frames, status, us10y, market_hist, taiex, chips, yahoo, status,
-                      args.risk_premium, twt49u)
+                      args.risk_premium, twt49u, mops_eps)
 
     value, sheet1, sheet2 = apply_filters(df)
     print(f"  💎 價值精選 {len(value)}｜📈 廣泛 {len(sheet1)}｜🛡️ 防禦 {len(sheet2)}"

@@ -142,3 +142,14 @@ def test_parse_twt49u_cash_mixed_and_stock_only():
     assert S.parse_twt49u(new) == [["2317", "2025-07-02", 5.8, False],
                                    ["1605", "2025-06-04", 0.5361, True]]
     assert S.parse_twt49u({}) == []
+
+
+def test_parse_mops_eps_multi_table():
+    import stock_sources as S
+    html = ("<table><tr><th>公司代號</th><th>公司名稱</th><th>基本每股盈餘（元）</th></tr>"
+            "<tr><td>2330</td><td>台積電</td><td>45.25</td></tr></table>"
+            "<table><tr><th>公司代號</th><th>公司名稱</th><th>基本每股盈餘（元）</th></tr>"
+            "<tr><td>2882</td><td>國泰金</td><td>7.29</td></tr>"
+            "<tr><td>1101</td><td>台泥</td><td>-1.6</td></tr></table>")
+    assert S.parse_mops_eps(html) == {"2330": 45.25, "2882": 7.29, "1101": -1.6}
+    assert S.parse_mops_eps("<html>查詢過於頻繁</html>") == {}
