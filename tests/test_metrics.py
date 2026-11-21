@@ -27,6 +27,13 @@ def test_dividend_stats_quarterly_ttm():
     assert s["consec_years"] == 1  # 只有 2025 是完整年度
 
 
+def test_dividend_stats_stopped_payer_streak_is_zero():
+    ev = [{"date": f"{y}-07-01", "amount": 1} for y in range(2010, 2024)]  # 2024、2025 未配
+    s = M.dividend_stats(ev, date(2026, 11, 21))
+    assert s["consec_years"] == 0
+    assert s["cum_years"] == 14
+
+
 def test_dividend_stats_suspended_is_zero_not_missing():
     s = M.dividend_stats([{"date": "2023-07-01", "amount": 3}], date(2026, 11, 21))
     assert s["dps"] == 0

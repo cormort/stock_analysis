@@ -98,7 +98,9 @@ def dividend_stats(events: list[dict], today: date | None = None) -> dict:
         "five_avg": five_avg,
         "stability": stability,
         "cum_years": len(positive_complete),
-        "consec_years": streak_years(positive_complete),
+        # 最近有配息的完整年度早於去年 → 已停發，連續年數歸 0（同 eps_stats 的錨定）
+        "consec_years": (streak_years(positive_complete)
+                         if positive_complete and max(positive_complete) >= today.year - 1 else 0),
         "data_years": len(complete),
         "span": span,
     }
