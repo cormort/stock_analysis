@@ -33,7 +33,6 @@ jobs:
             data/taiex.json
             data/twt49u.json
             data/twt49u_detail.json
-            data/mops_eps.json
             data/yahoo_hist.json
             data/us10y.json
           key: data-cache-${{ github.run_id }}
