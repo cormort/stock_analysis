@@ -41,4 +41,4 @@ echo
 
 # 3) 稍候開啟瀏覽器，再於前景啟動伺服器
 ( sleep 1; open "$URL" ) &
-python3 -m http.server "$PORT"
+python3 server.py "$PORT"

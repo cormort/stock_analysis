@@ -3,7 +3,7 @@
 ===================================
 架構：
   Phase 1: TWSE OpenAPI 批量篩選全市場 (PE/PB/殖利率/股利/獲利率)
-  Phase 2: twstock 個股補充分析 (即時報價 + 四大買賣點 + 均線)
+  Phase 2: TWSE 日行情技術分析 (四大買賣點 + 均線；即時報價改由 server.py 按需取得)
 
 優化項目：
   1. requests.Session 連線池 + 自動重試
@@ -506,45 +506,6 @@ def apply_filters(df_all: pd.DataFrame):
 # ───────────────────────────────────────────
 # 5b. twstock 個股補充分析
 # ───────────────────────────────────────────
-def _fetch_realtime_batch(codes: list) -> dict:
-    """批量抓取即時報價，回傳 {code: {price, change_pct, volume}} 或空 dict"""
-    result = {}
-    try:
-        # twstock.realtime.get 支援 list 批量查詢
-        for i in range(0, len(codes), 30):
-            batch = codes[i:i+30]
-            try:
-                data = twstock.realtime.get(batch) if len(batch) > 1 else {batch[0]: twstock.realtime.get(batch[0])}
-            except Exception as e:  # 單批有一檔缺欄位就整批失敗 → 只略過這批
-                print(f"\n  ⚠️  即時報價第 {i // 30 + 1} 批失敗: {e}", end='')
-                continue
-            for code in batch:
-                if code not in data or not isinstance(data[code], dict):
-                    continue
-                entry = data[code]
-                if not entry.get('success'):
-                    continue
-                rt = entry.get('realtime', {})
-                info = entry.get('info', {})
-                try:
-                    price = float(rt.get('latest_trade_price', '0').replace(',', ''))
-                    yesterday = float(rt.get('open', '0').replace(',', ''))  # 近似用開盤價
-                    volume = int(rt.get('accumulate_trade_volume', '0').replace(',', ''))
-                    change_pct = round((price / yesterday - 1) * 100, 2) if yesterday > 0 else 0
-                    result[code] = {
-                        '即時成交價': price,
-                        '漲跌幅%': change_pct,
-                        '成交量(張)': volume,
-                    }
-                except (ValueError, TypeError):
-                    pass
-            if i + 30 < len(codes):
-                time.sleep(2)
-    except Exception as e:
-        print(f"  ⚠️  即時報價抓取失敗: {e}")
-    return result
-
-
 DAILY_CACHE = "data/daily_prices.json"   # MI_INDEX 每日全市場行情快取（過去日期不會變）
 MA_DAYS = 60                             # 需要的交易日數（60日均價）
 MI_INDEX_URL = "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX"
@@ -647,28 +608,13 @@ def _analyze_history(rows: list) -> dict:
     return result
 
 
-def build_twstock_cache(codes: list, analysis_codes: list) -> tuple:
-    """回傳 (realtime_map, analysis_map)：即時報價走 twstock（codes）；
-    技術分析用 MI_INDEX 日行情本機計算，成本低，故涵蓋 analysis_codes（全市場）。"""
-    print(f"  📡 抓取 {len(codes)} 檔即時報價...", end=' ')
-    realtime_map = _fetch_realtime_batch(codes)
-    print(f"✅ 取得 {len(realtime_map)} 檔")
-
-    print("  📊 四大買賣點 + 均線分析（TWSE 日行情）")
-    hist = load_daily_history()
-    analysis_map = {c: _analyze_history(hist.get(c, [])) for c in analysis_codes}
-    return realtime_map, analysis_map
-
-
-def enrich_with_twstock(df: pd.DataFrame, realtime_map: dict, analysis_map: dict) -> pd.DataFrame:
-    """用預先抓好的快取補充即時報價 + 四大買賣點 + 均線分析（純對應，不發網路請求）"""
+def enrich_with_twstock(df: pd.DataFrame, analysis_map: dict) -> pd.DataFrame:
+    """補上四大買賣點 + 均線分析（純對應，不發網路請求）。
+    盤中即時報價不進快照，改由 server.py 的 /api/quote 在檢視時按需取得。"""
     if not TWSTOCK_AVAILABLE or df.empty:
         return df
 
     # 合併回 DataFrame
-    df['即時成交價'] = df['代號'].map(lambda c: realtime_map.get(c, {}).get('即時成交價', 0))
-    df['漲跌幅%']    = df['代號'].map(lambda c: realtime_map.get(c, {}).get('漲跌幅%', 0))
-    df['成交量(張)']  = df['代號'].map(lambda c: realtime_map.get(c, {}).get('成交量(張)', 0))
     df['四大買賣點']  = df['代號'].map(lambda c: analysis_map.get(c, {}).get('四大買賣點', '—'))
     df['技術面理由']  = df['代號'].map(lambda c: analysis_map.get(c, {}).get('技術面理由', '—'))
     df['5日均價']    = df['代號'].map(lambda c: analysis_map.get(c, {}).get('5日均價', 0))
@@ -697,8 +643,6 @@ COLUMN_DEFINITIONS = [
     {'欄位名稱': '溢價回收年限', '定義': '(股價 - 每股淨值) ÷ EPS。買入時多付的溢價，需要幾年的獲利才能賺回來', '數值越大代表': '⚠️ 溢價太高，回本時間長，風險較高', '數值越小代表': '✅ 溢價低甚至折價，回本快，安全邊際大', '存股參考': '⭐⭐ 核心安全指標！≤ 5 年極佳，≤ 10 年良好，> 15 年偏貴'},
     {'欄位名稱': '盈餘發放率 (%)', '定義': '現金股利 ÷ EPS × 100%。公司把賺到的錢拿出多少比例分給股東', '數值越大代表': '股東分到的比例高（但 >100% 代表借錢配息，危險⚠️）', '數值越小代表': '公司保留較多盈餘再投資（成長股常見）', '存股參考': '⭐ 存股理想區間 50%~85%，兼顧配息與公司成長動能'},
     {'欄位名稱': '投資CP值', '定義': '(殖利率 + 累積配息年數/2) ÷ (溢價回收年限+1)。綜合評分指標', '數值越大代表': '🌟 殖利率高 + 配息穩 + 溢價低 → 高性價比', '數值越小代表': '性價比低，可能殖利率差或溢價過高', '存股參考': '⭐⭐⭐ 本報告的核心排序指標，越高越值得優先研究'},
-    {'欄位名稱': '即時成交價', '定義': '由 twstock 抓取的即時成交價格（盤中為即時價，盤後為收盤價）', '數值越大代表': '當前股價高', '數值越小代表': '當前股價低', '存股參考': '搭配收盤價比較，看是否在合理買入區間'},
-    {'欄位名稱': '漲跌幅%', '定義': '今日即時價相對於開盤價的漲跌百分比', '數值越大代表': '🟢 今日上漲，市場看好', '數值越小代表': '🔴 今日下跌，可能是進場機會或警訊', '存股參考': '存股不追漲，下跌時分批買進反而有利'},
     {'欄位名稱': '四大買賣點', '定義': 'twstock 內建技術分析：量價關係 + 3日/6日均線交叉判斷買賣訊號', '數值越大代表': '—', '數值越小代表': '—', '存股參考': '⭐ 🟢買進 = 可考慮分批進場；🔴賣出 = 暫緩買入；⚪觀望 = 等待訊號'},
     {'欄位名稱': '技術面理由', '定義': '四大買賣點的具體觸發理由', '數值越大代表': '—', '數值越小代表': '—', '存股參考': '搭配四大買賣點一起看'},
     {'欄位名稱': '5日/20日/60日均價', '定義': '最近 N 日收盤價的簡單移動平均 (SMA)', '數值越大代表': '近期均價較高，可能處於上升趨勢', '數值越小代表': '近期均價較低', '存股參考': '⭐ 現價 < 20日均價 可能是進場機會；現價 > 60日均價很多則偏貴'},
@@ -842,16 +786,13 @@ def run_ultimate_dividend_screener():
 
     # 6) twstock 個股分析
     if TWSTOCK_AVAILABLE:
-        print(f"🔍 [5/7] twstock 混合分析（即時報價 + 四大買賣點 + 均線）...")
-        # 三分頁高度重疊 → 對 union 去重後只抓一次，再對應回各分頁
-        union_codes = pd.concat(
-            [value_sheet['代號'], sheet1['代號'], sheet2['代號']]
-        ).drop_duplicates().tolist()
-        realtime_map, analysis_map = build_twstock_cache(union_codes, df_all['代號'].tolist())
-        value_sheet = enrich_with_twstock(value_sheet, realtime_map, analysis_map)
-        sheet1 = enrich_with_twstock(sheet1, realtime_map, analysis_map)
-        sheet2 = enrich_with_twstock(sheet2, realtime_map, analysis_map)
-        df_all = enrich_with_twstock(df_all, realtime_map, analysis_map)
+        print("🔍 [5/7] 技術分析（TWSE 日行情 → 四大買賣點 + 均線，全市場）...")
+        hist = load_daily_history()
+        analysis_map = {c: _analyze_history(hist.get(c, [])) for c in df_all['代號']}
+        value_sheet = enrich_with_twstock(value_sheet, analysis_map)
+        sheet1 = enrich_with_twstock(sheet1, analysis_map)
+        sheet2 = enrich_with_twstock(sheet2, analysis_map)
+        df_all = enrich_with_twstock(df_all, analysis_map)
     else:
         print("⚠️ [5/7] twstock 不可用，跳過個股分析")
 
@@ -867,7 +808,7 @@ def run_ultimate_dividend_screener():
     print(f"   📈 廣泛價值標的: {len(sheet1)} 家")
     print(f"   🛡️ 嚴選防禦標的: {len(sheet2)} 家")
     print(f"   🌐 全市場: {len(df_all)} 家")
-    print(f"   🌐 用瀏覽器開 index.html 檢視（建議：python3 -m http.server 後開 http://localhost:8000）")
+    print(f"   🌐 檢視：python3 server.py 後開 http://localhost:8000（或雙擊 啟動.command）")
 
 
 # ───────────────────────────────────────────

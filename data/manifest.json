@@ -1,6 +1,17 @@
 {
   "snapshots": [
     {
+      "file": "snapshot_20261121_110837.json",
+      "generated_at": "2026-11-21T11:08:37",
+      "generated_at_display": "2026-11-21 11:08:37",
+      "counts": {
+        "value": 158,
+        "sheet1": 348,
+        "sheet2": 46,
+        "all": 1057
+      }
+    },
+    {
       "file": "snapshot_20261121_110436.json",
       "generated_at": "2026-11-21T11:04:36",
       "generated_at_display": "2026-11-21 11:04:36",
