@@ -1,0 +1,57 @@
+name: daily-screen
+
+on:
+  schedule:
+    - cron: "0 9 * * 1-5"      # 台灣 17:00（平日，TWSE 盤後資料已出齊）
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency: daily-screen
+
+jobs:
+  screen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      # 可重建快取（.gitignore 內）跨次保留：每次存新 key，從最近一次還原
+      - uses: actions/cache@v4
+        with:
+          path: |
+            data/daily_prices.json
+            data/chips.json
+            data/taiex.json
+            data/twt49u.json
+            data/twt49u_detail.json
+            data/yahoo_hist.json
+            data/us10y.json
+          key: data-cache-${{ github.run_id }}
+          restore-keys: data-cache-
+
+      - name: Run screener
+        env:
+          TZ: Asia/Taipei
+        run: python stock_screener.py
+
+      # validate 有 FAIL 就停（exit 1），不 commit 壞快照
+      - name: Validate
+        run: python validate.py
+
+      - name: Commit snapshot
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898299+github-actions[bot]@users.noreply.github.com"
+          git add data/manifest.json data/snapshot_*.json
+          git diff --cached --quiet && exit 0
+          git commit -m "每日快照 $(TZ=Asia/Taipei date +%F)"
+          git push
